@@ -372,9 +372,9 @@ struct CSRGraph {
     const int progress_step = std::max(1, num_nodes / 20);
     for (int u = 0; u < num_nodes; ++u) {
       if (u % progress_step == 0) {
-        std::cout << "[HCGC] build_coarsened_data: " << u << "/" << num_nodes
+        std::cout << "\r[HCGC] build_coarsened_data: " << u << "/" << num_nodes
                   << " (" << (100 * u / num_nodes) << "%)  "
-                  << "edges so far: " << edge_map.size() << "\n";
+                  << "edges so far: " << edge_map.size() << "   ";
         std::cout.flush();
       }
       int nu = cd.old_to_new[find_root(u)];
@@ -389,8 +389,8 @@ struct CSRGraph {
         edge_map[key] += edge_weight[e];
       }
     }
-    std::cout << "[HCGC] build_coarsened_data: " << num_nodes << "/" << num_nodes
-              << " (100%)  total edges: " << edge_map.size() << "\n";
+    std::cout << "\r[HCGC] build_coarsened_data: " << num_nodes << "/" << num_nodes
+              << " (100%)  total edges: " << edge_map.size() << "   \n";
     std::cout.flush();
     cd.src.reserve(edge_map.size());
     cd.dst.reserve(edge_map.size());
