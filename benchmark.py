@@ -190,40 +190,39 @@ def load_acm(root):
             if m is not None:
                 setattr(data[target], attr, m & labeled)
 
-    # Reconstruct missing val/test masks (older HGB format only ships train_mask).
-    tr_mask = getattr(data[target], 'train_mask', None)
-    missing = not (hasattr(data[target], 'val_mask') and
-                   data[target].val_mask is not None and
-                   hasattr(data[target], 'test_mask') and
-                   data[target].test_mask is not None)
-    if missing:
-        if tr_mask is None:
-            # No splits at all — create 60/20/20 random split.
-            torch.manual_seed(42)
-            perm = torch.randperm(n)
-            n_tr, n_va = int(0.6 * n), int(0.2 * n)
-            tr_m = torch.zeros(n, dtype=torch.bool)
-            va_m = torch.zeros(n, dtype=torch.bool)
-            te_m = torch.zeros(n, dtype=torch.bool)
-            tr_m[perm[:n_tr]]            = True
-            va_m[perm[n_tr:n_tr + n_va]] = True
-            te_m[perm[n_tr + n_va:]]     = True
-            data[target].train_mask = tr_m
-            data[target].val_mask   = va_m
-            data[target].test_mask  = te_m
-        else:
-            # Have train_mask; split remaining labeled nodes 50/50 → val/test.
-            rest = (y >= 0) & ~tr_mask
-            ids  = rest.nonzero(as_tuple=True)[0]
-            torch.manual_seed(42)
-            perm = torch.randperm(len(ids))
-            n_va = len(ids) // 2
-            va_m = torch.zeros(n, dtype=torch.bool)
-            te_m = torch.zeros(n, dtype=torch.bool)
-            va_m[ids[perm[:n_va]]]  = True
-            te_m[ids[perm[n_va:]]]  = True
-            data[target].val_mask  = va_m
-            data[target].test_mask = te_m
+    # ── Validate split sizes ──────────────────────────────────────────────────
+    # HGB's 'acm' format (lowercase) sometimes ships with only a few labeled
+    # nodes per split, producing a degenerate test set of 1–3 nodes and
+    # accuracy std > 0.4.  Rebuild all three splits from scratch whenever
+    # any split has fewer than MIN_SPLIT_SIZE nodes.
+    MIN_SPLIT_SIZE = 50
+
+    def _split_size(attr):
+        m = getattr(data[target], attr, None)
+        return int(m.sum().item()) if m is not None else 0
+
+    sz = {s: _split_size(f'{s}_mask') for s in ('train', 'val', 'test')}
+
+    if min(sz.values()) < MIN_SPLIT_SIZE:
+        # Full rebuild: 60 / 20 / 20 over all labeled paper nodes.
+        labeled_ids = (y >= 0).nonzero(as_tuple=True)[0]
+        n_lab       = len(labeled_ids)
+        torch.manual_seed(42)
+        perm  = torch.randperm(n_lab)
+        n_tr  = int(n_lab * 0.60)
+        n_va  = int(n_lab * 0.20)
+        tr_m = torch.zeros(n, dtype=torch.bool)
+        va_m = torch.zeros(n, dtype=torch.bool)
+        te_m = torch.zeros(n, dtype=torch.bool)
+        tr_m[labeled_ids[perm[:n_tr]]]           = True
+        va_m[labeled_ids[perm[n_tr:n_tr + n_va]]] = True
+        te_m[labeled_ids[perm[n_tr + n_va:]]]     = True
+        data[target].train_mask = tr_m
+        data[target].val_mask   = va_m
+        data[target].test_mask  = te_m
+        new_sz = {s: int(m.sum()) for s, m in
+                  [('train', tr_m), ('val', va_m), ('test', te_m)]}
+        print(f"  [ACM] HGB splits too small {sz} — rebuilt 60/20/20: {new_sz}")
 
     return data, target
 
