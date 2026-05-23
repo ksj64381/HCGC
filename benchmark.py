@@ -244,27 +244,38 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     from torch_geometric.loader import NeighborLoader
 
     # NeighborLoader needs torch-sparse or pyg-lib for the actual C++ sampling.
-    # Give a clear install hint instead of a cryptic ImportError mid-iteration.
-    _backend_ok = False
-    for _pkg in ('torch_sparse', 'pyg_lib'):
+    # Check both packages and surface a clear message for each failure mode.
+    _backend_ok   = False
+    _backend_diag = {}
+    for _pkg, _pip in [('torch_sparse', 'torch-sparse'), ('pyg_lib', 'pyg-lib')]:
         try:
             __import__(_pkg)
             _backend_ok = True
             break
         except ImportError:
-            pass
+            _backend_diag[_pip] = 'not installed'
+        except Exception as _e:
+            # Installed but C-extension failed to load (version mismatch, missing .so, …)
+            _backend_diag[_pip] = f'installed but failed to import ({type(_e).__name__}: {_e})'
+
     if not _backend_ok:
-        raise ImportError(
-            "\n\nMini-batch training (NeighborLoader) requires 'torch-sparse' "
-            "or 'pyg-lib'.\n"
-            "Quick install (replace torch/CUDA versions as needed):\n\n"
-            "  pip install torch-sparse\n\n"
-            "If that fails, use the version-specific wheel index:\n"
-            "  TORCH=$(python -c \"import torch; print(torch.__version__.split('+')[0])\")\n"
-            "  CUDA=$(python  -c \"import torch; "
-            "print('cu'+torch.version.cuda.replace('.','')[:3])\")\n"
-            "  pip install torch-sparse "
-            "-f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html\n"
+        _diag_lines = '\n'.join(
+            f'  {pkg}: {msg}' for pkg, msg in _backend_diag.items()
+        )
+        raise RuntimeError(
+            "\n\nNeighborLoader requires a *working* 'torch-sparse' or "
+            "'pyg-lib' C-extension.\n\n"
+            f"Diagnostic:\n{_diag_lines}\n\n"
+            "Fix options:\n"
+            "  1) Force-reinstall torch-sparse (most common fix):\n"
+            "       pip install --force-reinstall torch-sparse\n\n"
+            "  2) Use the version-specific wheel (replace X.Y.Z and cuZZZ):\n"
+            "       python -c \"import torch; "
+            "print(torch.__version__, torch.version.cuda)\"\n"
+            "       pip install torch-sparse "
+            "-f https://data.pyg.org/whl/torch-X.Y.Z+cuZZZ.html\n\n"
+            "  3) Diagnose the raw import error:\n"
+            "       python -c \"import torch_sparse\"\n"
         )
 
     dev = torch.device(
