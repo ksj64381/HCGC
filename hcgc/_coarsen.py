@@ -854,11 +854,17 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
     _record(hi_scale, cm_h, comp_h, t_h)
 
     if comp_h < target_compression:
+        # CDF scale too small: not enough compression.
+        # Use power-law jump (ratio-based) instead of fixed ×2.
         lo_scale = hi_scale
+        lo_comp  = comp_h
         prev_comp = comp_h
         plateau_count = 0
-        for _ in range(7):
-            hi_scale = lo_scale * 2.0
+        for _ in range(6):
+            # Jump by the compression ratio (power-law alpha≈1 estimate),
+            # clamped to [2×, 16×] to avoid overshoot on non-linear curves.
+            ratio    = target_compression / max(lo_comp, 1.0)
+            hi_scale = lo_scale * min(max(ratio, 2.0), 16.0)
             cm_h, comp_h, t_h = _run_if_new(hi_scale)
             _record(hi_scale, cm_h, comp_h, t_h)
             if comp_h >= target_compression:
@@ -881,31 +887,71 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
                 plateau_count = 0
             prev_comp = comp_h
             lo_scale  = hi_scale
+            lo_comp   = comp_h
         lo_scale_val = lo_scale
     else:
+        # CDF scale too large: too much compression.
+        # Use power-law jump (divide by ratio) instead of fixed /2.
         lo_scale = hi_scale
-        for _ in range(8):
-            lo_scale = lo_scale / 2.0
+        cur_comp = comp_h
+        for _ in range(5):
+            # Jump down by the compression ratio, clamped to [2×, 16×].
+            ratio    = cur_comp / max(target_compression, 1.0)
+            lo_scale = lo_scale / min(max(ratio, 2.0), 16.0)
             cm_l, comp_l, t_l = _run_if_new(lo_scale)
             _record(lo_scale, cm_l, comp_l, t_l)
             if comp_l < target_compression:
                 break
+            cur_comp = comp_l
         lo_scale_val = lo_scale
         hi_scale     = cdf_scale
 
     if verbose:
         print(f"  [AutoCoarsen] Bracket: [{lo_scale_val:.5f}, {hi_scale:.5f}]")
 
-    # ── Phase 2: geometric binary search ─────────────────────────────────────
+    # ── Phase 2: log-linear inverse interpolation (regula falsi in log-space) ──
+    # Assumes comp ∝ scale^alpha (power law).  Given bracket [lo_s, hi_s] with
+    # known compressions [lo_comp, hi_comp], solve directly for the target scale
+    # instead of bisecting.  Converges in 2-3 iterations vs 8 for bisection.
     if verbose:
-        print(f"\n  [AutoCoarsen] Phase 2: binary search (max {max_search_runs} runs)")
+        print(f"\n  [AutoCoarsen] Phase 2: log-linear interpolation "
+              f"(max {max_search_runs} runs)")
 
     lo_s, hi_s = lo_scale_val, hi_scale
     best_cm, best_comp, best_t, mid_scale = None, None, None, hi_scale
 
+    # Retrieve bracket endpoint compressions from run_log.
+    def _lookup_comp(scale):
+        tol = max(abs(scale) * 0.001, 1e-9)
+        matches = [r for r in run_log if abs(r['scale'] - scale) < tol]
+        return matches[-1]['comp'] if matches else None
+
+    lo_comp = _lookup_comp(lo_s)
+    hi_comp = _lookup_comp(hi_s)
+
     for _ in range(max_search_runs):
-        mid_scale = math.exp(
-            (math.log(max(lo_s, 1e-8)) + math.log(max(hi_s, 1e-8))) / 2)
+        # --- Log-linear inverse interpolation ---
+        # If we have valid bracket compressions, predict the target scale directly.
+        mid_scale = None
+        if (lo_comp is not None and hi_comp is not None
+                and lo_comp > 0 and hi_comp > lo_comp
+                and lo_comp < target_compression <= hi_comp
+                and lo_s < hi_s):
+            try:
+                alpha = ((math.log(hi_comp) - math.log(lo_comp)) /
+                         (math.log(max(hi_s, 1e-9)) - math.log(max(lo_s, 1e-9))))
+                if alpha > 0.05:
+                    log_s_tgt = (math.log(max(lo_s, 1e-9)) +
+                                 (math.log(target_compression) - math.log(lo_comp)) / alpha)
+                    mid_scale = math.exp(log_s_tgt)
+                    # Clamp strictly inside bracket to avoid degenerate repeats.
+                    mid_scale = max(lo_s * 1.0001, min(hi_s * 0.9999, mid_scale))
+            except (ValueError, ZeroDivisionError, OverflowError):
+                pass
+        if mid_scale is None:   # Fallback: geometric bisection
+            mid_scale = math.exp(
+                (math.log(max(lo_s, 1e-8)) + math.log(max(hi_s, 1e-8))) / 2)
+
         cm_m, comp_m, t_m = _run_if_new(mid_scale)
         _record(mid_scale, cm_m, comp_m, t_m)
 
@@ -914,13 +960,13 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
             best_cm, best_comp, best_t = cm_m, comp_m, t_m
             if verbose:
                 print(f"  [AutoCoarsen] Close enough ({rel_err*100:.1f}% error). "
-                      f"Stopping binary search.")
+                      f"Stopping search.")
             break
 
         if comp_m < target_compression:
-            lo_s = mid_scale
+            lo_s, lo_comp = mid_scale, comp_m
         else:
-            hi_s  = mid_scale
+            hi_s, hi_comp = mid_scale, comp_m
             best_cm, best_comp, best_t = cm_m, comp_m, t_m
 
     if best_cm is None:
