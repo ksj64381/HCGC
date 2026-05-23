@@ -139,92 +139,102 @@ def load_aminer(root):
 
 
 def load_acm(root):
-    """ACM paper network from the HGB benchmark (HGBn-ACM).
+    """ACM paper network with the standard HAN / MAGNN benchmark split.
 
-    Node types : paper (3 025), author (5 912), subject (57).
+    Downloaded once from the DGL mirror (ACM.zip → ACM.mat).
+    All labels are visible — no y=-1 hidden-test convention.
+
+    Node types : paper (3 025), author (5 912), conference.
     Target     : paper, 3-class research area
                  (Database / Wireless Comms / Data Mining).
-    Requires   : torch_geometric >= 2.0  (HGBDataset).
+    Split      : 600 train / 300 val / 2 125 test (standard ACM split).
+    Requires   : scipy  (pip install scipy)
+
+    Why not HGBDataset?
+        HGB's 'acm' format sets y=-1 for test nodes (competition style).
+        After HCGC supernode majority-voting, test supernodes inherit y=-1
+        and are never predicted correctly → 0 % test accuracy.
     """
+    import os, urllib.request, zipfile
     try:
-        from torch_geometric.datasets import HGBDataset
+        import scipy.io, scipy.sparse
     except ImportError:
-        sys.exit(
-            "ACM requires HGBDataset (torch_geometric >= 2.0). "
-            "Update PyG:  pip install -U torch_geometric"
-        )
+        sys.exit("ACM loader requires scipy:  pip install scipy")
+    from torch_geometric.data import HeteroData
 
-    # Different PyG releases use different name conventions for HGB datasets.
-    _candidates = ('HGBn-ACM', 'ACM', 'acm')
-    data = None
-    for _name in _candidates:
-        try:
-            data = HGBDataset(root=f'{root}/HGB', name=_name)[0]
+    acm_root = os.path.join(root, 'ACM_dgl')
+    mat_path = os.path.join(acm_root, 'ACM.mat')
+
+    if not os.path.exists(mat_path):
+        os.makedirs(acm_root, exist_ok=True)
+        url      = 'https://data.dgl.ai/dataset/ACM.zip'
+        zip_path = os.path.join(acm_root, 'ACM.zip')
+        print(f'  Downloading ACM from {url} ...')
+        urllib.request.urlretrieve(url, zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(acm_root)
+        os.remove(zip_path)
+        # The zip may extract into a sub-folder; move mat file up if needed.
+        nested = os.path.join(acm_root, 'ACM', 'ACM.mat')
+        if os.path.exists(nested) and not os.path.exists(mat_path):
+            import shutil
+            shutil.move(nested, mat_path)
+
+    mat = scipy.io.loadmat(mat_path)
+
+    def _dense(m):
+        return m.toarray() if scipy.sparse.issparse(m) else np.array(m)
+
+    def _sp_to_ei(sp):
+        if not scipy.sparse.issparse(sp):
+            sp = scipy.sparse.coo_matrix(np.array(sp))
+        coo = sp.tocoo()
+        return torch.stack([
+            torch.from_numpy(coo.row.astype('int64')),
+            torch.from_numpy(coo.col.astype('int64')),
+        ])
+
+    # ── Paper features & labels ───────────────────────────────────────────────
+    feat    = torch.from_numpy(_dense(mat['feature'])).float()
+    lbl_oh  = _dense(mat['label'])
+    labels  = torch.from_numpy(lbl_oh.argmax(axis=1).astype('int64'))
+    n_paper = feat.shape[0]
+
+    # ── Train / val / test masks ──────────────────────────────────────────────
+    def _to_mask(key):
+        idx = mat[key].flatten().astype('int64')
+        if len(idx) > 0 and idx.max() >= n_paper:   # 1-based MATLAB indexing
+            idx = idx - 1
+        m = torch.zeros(n_paper, dtype=torch.bool)
+        m[torch.from_numpy(idx)] = True
+        return m
+
+    data = HeteroData()
+    data['paper'].x          = feat
+    data['paper'].y          = labels
+    data['paper'].train_mask = _to_mask('train_idx')
+    data['paper'].val_mask   = _to_mask('val_idx')
+    data['paper'].test_mask  = _to_mask('test_idx')
+
+    # ── Paper–Author edges ────────────────────────────────────────────────────
+    PA = mat['PvsA']
+    data[('paper', 'written_by', 'author')].edge_index = _sp_to_ei(PA)
+    data[('author', 'writes', 'paper')].edge_index     = _sp_to_ei(PA).flip(0)
+    data['author'].num_nodes = int(PA.shape[1])
+
+    # ── Paper–Paper citation edges ────────────────────────────────────────────
+    if 'PvsP' in mat:
+        data[('paper', 'cites', 'paper')].edge_index = _sp_to_ei(mat['PvsP'])
+
+    # ── Paper–Conference edges (skip PvsL — it encodes the class labels) ──────
+    for ck, nname in [('PvsC', 'conference'), ('PvsV', 'venue')]:
+        if ck in mat and hasattr(mat[ck], 'shape') and mat[ck].shape[1] > 3:
+            data[('paper', 'in', nname)].edge_index       = _sp_to_ei(mat[ck])
+            data[(nname, 'contains', 'paper')].edge_index = _sp_to_ei(mat[ck]).flip(0)
+            data[nname].num_nodes = int(mat[ck].shape[1])
             break
-        except (AssertionError, ValueError):
-            continue
-    if data is None:
-        _avail = list(HGBDataset.names.keys()) if hasattr(HGBDataset, 'names') else '?'
-        sys.exit(
-            f"Could not load ACM from HGBDataset (tried: {_candidates}).\n"
-            f"Available HGB dataset names in your PyG version: {_avail}\n"
-            "Try updating PyG:  pip install -U torch_geometric"
-        )
-    target = 'paper'
-    n      = data[target].num_nodes
 
-    # Normalise: some HGB releases store integer-index tensors, not bool masks.
-    for attr in ('train_mask', 'val_mask', 'test_mask'):
-        m = getattr(data[target], attr, None)
-        if m is not None and m.dtype != torch.bool:
-            mask = torch.zeros(n, dtype=torch.bool)
-            mask[m.long()] = True
-            setattr(data[target], attr, mask)
-
-    # Guard: restrict masks to nodes with valid labels (y >= 0).
-    y = data[target].y
-    if y is not None and (y < 0).any():
-        labeled = y >= 0
-        for attr in ('train_mask', 'val_mask', 'test_mask'):
-            m = getattr(data[target], attr, None)
-            if m is not None:
-                setattr(data[target], attr, m & labeled)
-
-    # ── Validate split sizes ──────────────────────────────────────────────────
-    # HGB's 'acm' format (lowercase) sometimes ships with only a few labeled
-    # nodes per split, producing a degenerate test set of 1–3 nodes and
-    # accuracy std > 0.4.  Rebuild all three splits from scratch whenever
-    # any split has fewer than MIN_SPLIT_SIZE nodes.
-    MIN_SPLIT_SIZE = 50
-
-    def _split_size(attr):
-        m = getattr(data[target], attr, None)
-        return int(m.sum().item()) if m is not None else 0
-
-    sz = {s: _split_size(f'{s}_mask') for s in ('train', 'val', 'test')}
-
-    if min(sz.values()) < MIN_SPLIT_SIZE:
-        # Full rebuild: 60 / 20 / 20 over all labeled paper nodes.
-        labeled_ids = (y >= 0).nonzero(as_tuple=True)[0]
-        n_lab       = len(labeled_ids)
-        torch.manual_seed(42)
-        perm  = torch.randperm(n_lab)
-        n_tr  = int(n_lab * 0.60)
-        n_va  = int(n_lab * 0.20)
-        tr_m = torch.zeros(n, dtype=torch.bool)
-        va_m = torch.zeros(n, dtype=torch.bool)
-        te_m = torch.zeros(n, dtype=torch.bool)
-        tr_m[labeled_ids[perm[:n_tr]]]           = True
-        va_m[labeled_ids[perm[n_tr:n_tr + n_va]]] = True
-        te_m[labeled_ids[perm[n_tr + n_va:]]]     = True
-        data[target].train_mask = tr_m
-        data[target].val_mask   = va_m
-        data[target].test_mask  = te_m
-        new_sz = {s: int(m.sum()) for s, m in
-                  [('train', tr_m), ('val', va_m), ('test', te_m)]}
-        print(f"  [ACM] HGB splits too small {sz} — rebuilt 60/20/20: {new_sz}")
-
-    return data, target
+    return data, 'paper'
 
 
 LOADERS = {
