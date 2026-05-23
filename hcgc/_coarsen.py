@@ -722,12 +722,15 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
         return baseline - p, p
 
     def _record(scale, cm, comp, t):
-        pl, pr = _probe_loss(cm)
+        # Skip per-run probe during search: LogisticRegression on the full
+        # dataset (e.g. 26k nodes, 256-dim) costs ~2s per call.  We compute
+        # probe accuracy only once for the final best result (see below).
         run_log.append({'scale': scale, 'comp': comp,
-                        'probe': pr, 'probe_loss': pl, 'cm': cm, 't': t})
+                        'probe': float('nan'), 'probe_loss': float('nan'),
+                        'cm': cm, 't': t})
         if verbose:
-            print(f"    scale={scale:.5f}  comp={comp:.2f}x  probe_loss={pl:.4f}")
-        return pl
+            print(f"    scale={scale:.5f}  comp={comp:.2f}x")
+        return float('nan')
 
     _max_levels = getattr(args, 'hcgc_num_levels', 5)
     calib_args.num_levels             = _max_levels
