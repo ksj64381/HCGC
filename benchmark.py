@@ -2,7 +2,7 @@
 """
 benchmark.py -- Reproduce HCGC compression benchmarks.
 
-Supported datasets: imdb, dblp, lastfm, ogbn-mag
+Supported datasets: imdb, dblp, lastfm, ogbn-mag, aminer, acm
 
 Timing note
 -----------
@@ -12,10 +12,12 @@ This script excludes warmup runs from all reported measurements; see --warmup.
 
 Usage
 -----
-    python benchmark.py --dataset imdb    --ratio 0.1
-    python benchmark.py --dataset dblp    --ratio 0.1 --runs 5
-    python benchmark.py --dataset lastfm  --ratio 0.1
+    python benchmark.py --dataset imdb     --ratio 0.1
+    python benchmark.py --dataset dblp     --ratio 0.1 --runs 5
+    python benchmark.py --dataset lastfm   --ratio 0.1
     python benchmark.py --dataset ogbn-mag --ratio 0.1 --runs 1 --warmup 1
+    python benchmark.py --dataset aminer   --ratio 0.1 --baseline
+    python benchmark.py --dataset acm      --ratio 0.1 --baseline
 """
 
 import argparse
@@ -95,11 +97,94 @@ def load_ogbn_mag(root):
     return data, 'paper'
 
 
+def load_aminer(root):
+    """AMiner citation network (via torch_geometric.datasets.AMiner).
+
+    Node types : author (6 564), paper (12 499), venue (35).
+    Target     : author, 4-class research area.
+    Splits     : creates a 60 / 20 / 20 random split (seed=42) on
+                 authors when the dataset does not supply masks.
+    Features   : paper nodes have TF-IDF features; author & venue
+                 nodes have no raw features (log-degree injected by
+                 _add_degree_features before compression).
+    """
+    from torch_geometric.datasets import AMiner
+    data   = AMiner(root=f'{root}/AMiner')[0]
+    target = 'author'
+    n      = data[target].num_nodes
+
+    if not (hasattr(data[target], 'y') and data[target].y is not None):
+        raise RuntimeError(
+            "AMiner 'author' nodes have no .y labels — "
+            "check your torch_geometric installation or re-download."
+        )
+
+    # Create 60/20/20 split if the dataset does not ship with masks
+    if not (hasattr(data[target], 'train_mask')
+            and data[target].train_mask is not None):
+        torch.manual_seed(42)
+        perm  = torch.randperm(n)
+        n_tr, n_va = int(0.6 * n), int(0.2 * n)
+        tr = torch.zeros(n, dtype=torch.bool)
+        va = torch.zeros(n, dtype=torch.bool)
+        te = torch.zeros(n, dtype=torch.bool)
+        tr[perm[:n_tr]]            = True
+        va[perm[n_tr:n_tr + n_va]] = True
+        te[perm[n_tr + n_va:]]     = True
+        data[target].train_mask = tr
+        data[target].val_mask   = va
+        data[target].test_mask  = te
+
+    return data, target
+
+
+def load_acm(root):
+    """ACM paper network from the HGB benchmark (HGBn-ACM).
+
+    Node types : paper (3 025), author (5 912), subject (57).
+    Target     : paper, 3-class research area
+                 (Database / Wireless Comms / Data Mining).
+    Requires   : torch_geometric >= 2.0  (HGBDataset).
+    """
+    try:
+        from torch_geometric.datasets import HGBDataset
+    except ImportError:
+        sys.exit(
+            "ACM requires HGBDataset (torch_geometric >= 2.0). "
+            "Update PyG:  pip install -U torch_geometric"
+        )
+
+    data   = HGBDataset(root=f'{root}/HGB', name='HGBn-ACM')[0]
+    target = 'paper'
+    n      = data[target].num_nodes
+
+    # Some HGB releases store integer-index tensors instead of bool masks;
+    # normalise to bool so the rest of the pipeline works uniformly.
+    for attr in ('train_mask', 'val_mask', 'test_mask'):
+        m = getattr(data[target], attr, None)
+        if m is not None and m.dtype != torch.bool:
+            mask = torch.zeros(n, dtype=torch.bool)
+            mask[m] = True
+            setattr(data[target], attr, mask)
+
+    # Guard: if some y values are -1 (label withheld), restrict masks.
+    if data[target].y is not None and (data[target].y < 0).any():
+        labeled = data[target].y >= 0
+        for attr in ('train_mask', 'val_mask', 'test_mask'):
+            m = getattr(data[target], attr, None)
+            if m is not None:
+                setattr(data[target], attr, m & labeled)
+
+    return data, target
+
+
 LOADERS = {
     'imdb':     load_imdb,
     'dblp':     load_dblp,
     'lastfm':   load_lastfm,
     'ogbn-mag': load_ogbn_mag,
+    'aminer':   load_aminer,
+    'acm':      load_acm,
 }
 
 
