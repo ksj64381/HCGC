@@ -224,15 +224,128 @@ class _HeteroSAGE(torch.nn.Module):
         return self.clf(h[target_type])
 
 
+# Total-node threshold above which full-batch GNN training is replaced
+# by NeighborLoader mini-batch training to avoid GPU OOM.
+_FULL_BATCH_NODE_LIMIT = 100_000
+
+
+def _train_mini_batch_downstream(data, target_type, device_str,
+                                  epochs=200, lr=1e-3, patience=30,
+                                  hidden=256, batch_size=512):
+    """Mini-batch HeteroSAGE training via NeighborLoader.
+
+    Used automatically by train_on_heterodata when the graph has more than
+    _FULL_BATCH_NODE_LIMIT total nodes (e.g. AMiner, ogbn-mag).
+
+    Samples 2-hop neighbourhoods with at most 10 neighbours per edge type
+    per hop; this keeps each mini-batch subgraph tractable while still
+    giving each seed node a meaningful receptive field.
+    """
+    from torch_geometric.loader import NeighborLoader
+
+    dev = torch.device(
+        ('cuda' if torch.cuda.is_available() else 'cpu')
+        if device_str == 'auto' else device_str)
+
+    feat_dims = {
+        nt: data[nt].x.shape[1]
+        for nt in data.node_types
+        if hasattr(data[nt], 'x') and data[nt].x is not None
+    }
+    num_classes = int(data[target_type].y.max().item()) + 1
+    model = _HeteroSAGE(data.edge_types, feat_dims, hidden, num_classes).to(dev)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+
+    num_neighbors = [10, 10]   # 2 hops, 10 neighbours per edge type per hop
+
+    train_loader = NeighborLoader(
+        data,
+        num_neighbors = num_neighbors,
+        batch_size    = batch_size,
+        input_nodes   = (target_type, data[target_type].train_mask),
+        shuffle       = True,
+    )
+    val_loader = NeighborLoader(
+        data,
+        num_neighbors = num_neighbors,
+        batch_size    = batch_size * 4,
+        input_nodes   = (target_type, data[target_type].val_mask),
+        shuffle       = False,
+    )
+    test_loader = NeighborLoader(
+        data,
+        num_neighbors = num_neighbors,
+        batch_size    = batch_size * 4,
+        input_nodes   = (target_type, data[target_type].test_mask),
+        shuffle       = False,
+    )
+
+    def _eval(loader):
+        correct = total = 0
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(dev)
+                out   = model(batch.x_dict, batch.edge_index_dict, target_type)
+                n     = batch[target_type].batch_size
+                pred  = out[:n].argmax(dim=1)
+                correct += (pred == batch[target_type].y[:n]).sum().item()
+                total   += n
+        return correct / max(total, 1)
+
+    best_val, best_test = 0.0, 0.0
+    no_improve          = 0
+    eval_every          = 10
+    patience_steps      = max(patience // eval_every, 1)
+    t0 = time.perf_counter()
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        for batch in train_loader:
+            batch = batch.to(dev)
+            out   = model(batch.x_dict, batch.edge_index_dict, target_type)
+            n     = batch[target_type].batch_size
+            loss  = F.cross_entropy(out[:n], batch[target_type].y[:n])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        if ep % eval_every == 0:
+            model.eval()
+            val_acc  = _eval(val_loader)
+            test_acc = _eval(test_loader)
+
+            if val_acc > best_val:
+                best_val, best_test, no_improve = val_acc, test_acc, 0
+            else:
+                no_improve += 1
+
+            if no_improve >= patience_steps:
+                break
+
+    return best_test, time.perf_counter() - t0
+
+
 def train_on_heterodata(data, target_type, device_str,
-                        epochs=200, lr=1e-3, patience=30, hidden=256):
+                        epochs=200, lr=1e-3, patience=30, hidden=256,
+                        mini_batch_size=512):
     """Train a 2-layer HeteroSAGE on any HeteroData object.
+
+    Automatically switches to mini-batch (NeighborLoader) mode when the
+    total node count exceeds _FULL_BATCH_NODE_LIMIT (100 k) to avoid OOM.
 
     Returns
     -------
     test_acc : float
     elapsed  : float   wall-clock seconds (model init + all epochs)
     """
+    n_total = sum(data[nt].num_nodes for nt in data.node_types)
+    if n_total > _FULL_BATCH_NODE_LIMIT:
+        return _train_mini_batch_downstream(
+            data, target_type, device_str,
+            epochs=epochs, lr=lr, patience=patience, hidden=hidden,
+            batch_size=mini_batch_size,
+        )
+
     dev = torch.device(
         ('cuda' if torch.cuda.is_available() else 'cpu')
         if device_str == 'auto' else device_str)
@@ -287,30 +400,35 @@ def train_on_heterodata(data, target_type, device_str,
 
 
 def train_downstream(result, target_type, device_str,
-                     epochs=200, lr=1e-3, patience=30, hidden=256):
+                     epochs=200, lr=1e-3, patience=30, hidden=256,
+                     mini_batch_size=512):
     """Thin wrapper: train on a compressed HCGCResult."""
     return train_on_heterodata(result.data, target_type, device_str,
                                epochs=epochs, lr=lr, patience=patience,
-                               hidden=hidden)
+                               hidden=hidden, mini_batch_size=mini_batch_size)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Single benchmark run
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256):
+def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
+                 mini_batch_size=512):
     """Train on the original (uncompressed) graph. Returns (test_acc, elapsed).
 
     Uses a generous patience (= train_epochs // 5) so the model trains until
     genuine convergence rather than stopping at an early local plateau.
+    Large graphs (>100 k nodes) are handled automatically via mini-batch.
     """
     return train_on_heterodata(data, target_type, device,
                                epochs=train_epochs, hidden=train_hidden,
-                               patience=train_epochs // 5)
+                               patience=train_epochs // 5,
+                               mini_batch_size=mini_batch_size)
 
 
 def run_once(data, target_type, ratio, device, pretrain,
-             train_epochs=200, train_hidden=256, verbose=False):
+             train_epochs=200, train_hidden=256, verbose=False,
+             mini_batch_size=512):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
@@ -332,9 +450,10 @@ def run_once(data, target_type, ratio, device, pretrain,
     # ── Downstream training ───────────────────────────────────────────────────
     test_acc, t_train = train_downstream(
         result, target_type,
-        device_str   = device,
-        epochs       = train_epochs,
-        hidden       = train_hidden,
+        device_str      = device,
+        epochs          = train_epochs,
+        hidden          = train_hidden,
+        mini_batch_size = mini_batch_size,
     )
 
     n_orig = result.info['n_nodes_orig']
@@ -389,6 +508,9 @@ def main():
                         help='Downstream training epochs per run')
     parser.add_argument('--train-hidden', type=int, default=256,
                         help='Hidden dim for downstream GNN')
+    parser.add_argument('--mini-batch-size', type=int, default=512,
+                        help='Seed-node batch size for downstream GNN training on large graphs '
+                             '(>100 k nodes). Reduce if GPU OOM on dense graphs.')
     parser.add_argument('--baseline', action='store_true',
                         help='Also train on the original graph and print speedup comparison')
     args = parser.parse_args()
@@ -417,6 +539,9 @@ def main():
     print(f"  edge types : {len(data.edge_types)}")
     print(f"  total nodes: {n_nodes:,}   total edges: {n_edges:,}")
     print(f"  target type: {target_type!r}")
+    if n_nodes > _FULL_BATCH_NODE_LIMIT:
+        print(f"  [large graph — downstream GNN will use mini-batch "
+              f"(batch_size={args.mini_batch_size})]")
 
     # ── Baseline (original graph training) ───────────────────────────────────
     base_records = []
@@ -426,7 +551,8 @@ def main():
             print(f"  baseline run {i+1}/{args.runs} ... ", end='', flush=True)
             acc, t = run_baseline(data, target_type, args.device,
                                   train_epochs=args.train_epochs,
-                                  train_hidden=args.train_hidden)
+                                  train_hidden=args.train_hidden,
+                                  mini_batch_size=args.mini_batch_size)
             base_records.append({'t_train': t, 'test_acc': acc})
             print(f"t={t:.1f}s  test_acc={acc:.4f}")
 
@@ -442,13 +568,15 @@ def main():
             t_wu = time.perf_counter()
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
-                     pretrain=False, verbose=False)
+                     pretrain=False, verbose=False,
+                     mini_batch_size=args.mini_batch_size)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
-                     pretrain=pretrain, verbose=False)
+                     pretrain=pretrain, verbose=False,
+                     mini_batch_size=args.mini_batch_size)
             print(f"  warmup {i+1}/{args.warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Timed runs ────────────────────────────────────────────────────────────
@@ -458,12 +586,13 @@ def main():
         print(f"  run {i+1}/{args.runs} ... ", end='', flush=True)
         r = run_once(
             data, target_type,
-            ratio        = args.ratio,
-            device       = args.device,
-            pretrain     = pretrain,
-            train_epochs = args.train_epochs,
-            train_hidden = args.train_hidden,
-            verbose      = False,
+            ratio           = args.ratio,
+            device          = args.device,
+            pretrain        = pretrain,
+            train_epochs    = args.train_epochs,
+            train_hidden    = args.train_hidden,
+            verbose         = False,
+            mini_batch_size = args.mini_batch_size,
         )
         records.append(r)
         print(
