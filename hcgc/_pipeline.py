@@ -214,18 +214,22 @@ def _coarsen_from_context(ctx, args):
         if ctx.get('emb_dict') is None:
             print("  [AutoCoarsen] WARNING: no embeddings in context; "
                   "probe will be random. Consider pretrain=True.")
+        _t_auto = time.perf_counter()
         cm, t_c, info = auto_coarsen(
             ctx, args,
             target_ratio=args.target_ratio,
             max_acc_loss=getattr(args, 'max_acc_loss', 0.05),
             fast_scale=getattr(args, 'use_fast_scale', False),
+            run_probe=getattr(args, 'run_probe', True),
         )
+        t_c = time.perf_counter() - _t_auto  # total search time, not just one run
     else:
         cm, t_c = _run_coarsen(
             ctx['src_nodes'], ctx['dst_nodes'], ctx['weights'],
             ctx['coarsen_features'], ctx['type_boundaries'],
             ctx['coarsen_feat_dims'], args)
-    print(f"\n  Coarsen time: {t_c:.2f}s")
+    print(f"\n  Coarsen time: {t_c:.2f}s  (auto-coarsen search)"
+          if use_auto else f"\n  Coarsen time: {t_c:.2f}s")
 
     return cm, t_c
 

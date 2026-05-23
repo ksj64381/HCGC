@@ -2,6 +2,7 @@
 hcgc/_api.py -- Public compress() API and HCGCResult dataclass.
 """
 
+import time
 import types
 import numpy as np
 import torch
@@ -90,11 +91,16 @@ def compress(
         dev_str = str(device)
     _cfg_mod.set_device(dev_str)
 
+    t_total = time.perf_counter()
+
     # ── Ensure all node types have feature tensors ────────────────────────────
     # Some datasets (e.g. DBLP 'conference', ogbn-mag non-paper types) ship
     # without node features.  Inject a 1-D log-degree feature so the pipeline
     # never sees a missing x.
+    _t = time.perf_counter()
     data = _ensure_node_features(data)
+    if verbose:
+        print(f"[HCGC] ensure_features:      {time.perf_counter()-_t:.2f}s")
 
     # ── Configure _CFG from the provided HeteroData ──────────────────────────
     _CFG.node_types  = list(data.node_types)
@@ -116,18 +122,27 @@ def compress(
                        num_neighbors=num_neighbors)
 
     # ── Pretrain (or fast-embed) + extract flat arrays ────────────────────────
+    _t = time.perf_counter()
     ctx = _load_and_pretrain(data, args)
+    if verbose:
+        print(f"[HCGC] load_and_pretrain:    {time.perf_counter()-_t:.2f}s")
 
     # ── Auto-coarsen ──────────────────────────────────────────────────────────
+    _t = time.perf_counter()
     cm, t_c = _coarsen_from_context(ctx, args)
+    if verbose:
+        print(f"[HCGC] coarsen_from_context: {time.perf_counter()-_t:.2f}s")
 
     # ── Build compressed HeteroData ───────────────────────────────────────────
+    _t = time.perf_counter()
     cdata, local_cm, stats = build_compressed_data(
         data, cm,
         ctx['offsets'], ctx['type_boundaries'],
         use_soft_labels=False,
         emb_dict=ctx['emb_dict'] if pretrain else None,
     )
+    if verbose:
+        print(f"[HCGC] build_compressed_data:{time.perf_counter()-_t:.2f}s")
 
     n_orig = int(ctx['type_boundaries'][-1])
     n_comp = len(np.unique(cm))
@@ -146,6 +161,7 @@ def compress(
     }
 
     if verbose:
+        print(f"[HCGC] total compress():     {time.perf_counter()-t_total:.2f}s")
         print(f"\n[HCGC] Done: {n_orig:,} -> {n_comp:,} nodes  "
               f"(actual ratio={actual_ratio:.3f}, {1/actual_ratio:.1f}x)")
 
@@ -266,4 +282,8 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         # Misc
         base_seed                   = 42,
         use_label_aware_split       = False,
+        # Probe (accuracy estimation via linear classifier on embeddings).
+        # Disabled by default in compress() because: (a) probe results are not
+        # exposed in HCGCResult.info, and (b) LR on large graphs is very slow.
+        run_probe                   = False,
     )

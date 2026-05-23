@@ -667,7 +667,8 @@ def _run_coarsen_cheap(ctx, args, scale):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
-                 max_search_runs=8, verbose=True, fast_scale=False):
+                 max_search_runs=8, verbose=True, fast_scale=False,
+                 run_probe=True):
     """Find the optimal HCGC scale in a small number of coarsening runs.
 
     Args:
@@ -706,10 +707,15 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
     _pertype_base = list(getattr(args, 'hcgc_feat_var_scale_by_type', None) or [])
     _use_pertype  = bool(_pertype_base)
 
-    t0 = time.time()
-    baseline = _baseline_probe(ctx)
-    if verbose:
-        print(f"  [AutoCoarsen] Baseline probe: {baseline:.4f}  ({time.time()-t0:.1f}s)")
+    if run_probe:
+        t0 = time.time()
+        baseline = _baseline_probe(ctx)
+        if verbose:
+            print(f"  [AutoCoarsen] Baseline probe: {baseline:.4f}  ({time.time()-t0:.1f}s)")
+    else:
+        baseline = float('nan')
+        if verbose:
+            print(f"  [AutoCoarsen] Baseline probe: skipped (run_probe=False)")
 
     cdf_scale, _ = predict_scale_for_compression(
         ctx, target_ratio, verbose=False)
@@ -718,6 +724,8 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
     seen_scales = set()
 
     def _probe_loss(cm):
+        if not run_probe or math.isnan(baseline):
+            return float('nan'), float('nan')
         p = _probe_from_coalition_map(cm, ctx)
         return baseline - p, p
 
