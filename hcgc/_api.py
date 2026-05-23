@@ -237,7 +237,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         use_auto_coarsen            = True,
         target_ratio                = ratio,
         max_acc_loss                = 0.1,
-        use_fast_scale              = False,
+        use_fast_scale              = True,
         coarsen_pca_dim             = 0,
         # HCGC kernel params
         hcgc_inner_passes           = 2,

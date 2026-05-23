@@ -3,8 +3,11 @@ hcgc/_coarsen.py -- Graph coarsening: flat array extraction, HCGC core,
                     auto_coarsen (bracket + binary search), and scale prediction.
 """
 
+import contextlib
 import copy
 import math
+import os
+import sys
 import time
 import numpy as np
 import torch
@@ -273,9 +276,38 @@ def _pca_reduce_features(all_features, feature_dims, type_boundaries, target_dim
 # Core coarsening runner
 # ══════════════════════════════════════════════════════════════════════════════
 
+class _SuppressCStdout:
+    """Context manager that silences C-level stdout (fd 1).
+
+    Python's sys.stdout redirect does not affect C extensions that write
+    directly to file descriptor 1.  This manager saves and restores the fd
+    so that noisy C++ kernels are quiet during auto-coarsen search runs.
+    Falls back to a no-op on platforms where fd manipulation is unavailable.
+    """
+    def __enter__(self):
+        try:
+            sys.stdout.flush()
+            self._old_fd  = os.dup(1)
+            self._devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(self._devnull, 1)
+            self._active  = True
+        except Exception:
+            self._active  = False
+        return self
+
+    def __exit__(self, *_):
+        if getattr(self, '_active', False):
+            try:
+                os.dup2(self._old_fd, 1)
+                os.close(self._old_fd)
+                os.close(self._devnull)
+            except Exception:
+                pass
+
+
 def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
                  type_boundaries, feature_dims, args,
-                 mds_override=None, nlvl_override=None):
+                 mds_override=None, nlvl_override=None, silent=False):
     # mds_override is unused; retained for API compatibility
     hub_caps = (np.array([], dtype=np.int32) if args.auto_hub_caps or not args.hub_degree_caps.strip()
                 else np.array([int(x) for x in args.hub_degree_caps.split(',')], dtype=np.int32))
@@ -317,19 +349,22 @@ def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
     else:
         _pt_arr = np.array([], dtype=np.float32)
 
-    try:
-        cm = hcgc_module.create_graph_hcgc(
-            *_base_args,
-            getattr(args, 'hcgc_skip_reassignment', False),
-            getattr(args, 'hcgc_window_size', 20),
-            getattr(args, 'hub_anchor_percentile', 0.0),
-            _pt_arr,
-            float(getattr(args, 'hcgc_target_comp_ratio', 0.0)),
-        )
-    except TypeError:
-        print("  [warn] Old hcgc_module version - some parameters not supported.\n"
-              "         Please rebuild: python setup.py build_ext --inplace")
-        cm = hcgc_module.create_graph_hcgc(*_base_args)
+    _ctx_mgr = _SuppressCStdout() if silent else contextlib.nullcontext()
+    with _ctx_mgr:
+        try:
+            cm = hcgc_module.create_graph_hcgc(
+                *_base_args,
+                getattr(args, 'hcgc_skip_reassignment', False),
+                getattr(args, 'hcgc_window_size', 20),
+                getattr(args, 'hub_anchor_percentile', 0.0),
+                _pt_arr,
+                float(getattr(args, 'hcgc_target_comp_ratio', 0.0)),
+            )
+        except TypeError:
+            if not silent:
+                print("  [warn] Old hcgc_module version - some parameters not supported.\n"
+                      "         Please rebuild: python setup.py build_ext --inplace")
+            cm = hcgc_module.create_graph_hcgc(*_base_args)
     return cm, time.time() - t0
 
 
@@ -651,13 +686,17 @@ def _baseline_probe(ctx):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_coarsen_cheap(ctx, args, scale):
-    """Run HCGC coarsening at the given feat_var_scale; return (cm, comp, t)."""
+    """Run HCGC coarsening at the given feat_var_scale; return (cm, comp, t).
+
+    C-level stdout is suppressed here because this is always called from the
+    auto-coarsen search loop where verbose kernel output is unwanted noise.
+    """
     args.hcgc_feat_var_scale = scale
     n_total = int(ctx['type_boundaries'][-1])
     cm, t = _run_coarsen(
         ctx['src_nodes'], ctx['dst_nodes'], ctx['weights'],
         ctx['coarsen_features'], ctx['type_boundaries'],
-        ctx['coarsen_feat_dims'], args)
+        ctx['coarsen_feat_dims'], args, silent=True)
     comp = n_total / max(len(np.unique(cm)), 1)
     return cm, comp, t
 
@@ -852,6 +891,7 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
             if not math.isnan(final_probe_loss) and final_probe_loss > max_acc_loss:
                 print(f"  [AutoCoarsen] WARNING: probe_loss={final_probe_loss:.4f} "
                       f"> {max_acc_loss:.3f} -- significant accuracy drop expected.")
+            sys.stdout.flush()
 
         return best_cm, best_t, _make_info(
             best_comp, final_probe, final_probe_loss, mid_scale, n_runs)
@@ -1003,6 +1043,7 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
         if not math.isnan(final_probe_loss) and final_probe_loss > max_acc_loss:
             print(f"  [AutoCoarsen] WARNING: probe_loss={final_probe_loss:.4f} "
                   f"> {max_acc_loss:.3f} -- significant accuracy drop expected.")
+        sys.stdout.flush()
 
     return best_cm, best_t, _make_info(
         best_comp, final_probe, final_probe_loss, mid_scale, n_runs)
