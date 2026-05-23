@@ -56,19 +56,19 @@ def _add_degree_features(data):
 
 def load_imdb(root):
     from torch_geometric.datasets import IMDB
-    data = IMDB(root=root)[0]
+    data = IMDB(root=f'{root}/IMDB')[0]
     return data, 'movie'
 
 
 def load_dblp(root):
     from torch_geometric.datasets import DBLP
-    data = DBLP(root=root)[0]
+    data = DBLP(root=f'{root}/DBLP')[0]
     return data, 'author'
 
 
 def load_lastfm(root):
     from torch_geometric.datasets import LastFM
-    data = LastFM(root=root)[0]
+    data = LastFM(root=f'{root}/LastFM')[0]
     return data, 'user'
 
 
@@ -78,7 +78,7 @@ def load_ogbn_mag(root):
     except ImportError:
         sys.exit("ogbn-mag requires the ogb package:  pip install ogb")
 
-    dataset   = PygNodePropPredDataset(name='ogbn-mag', root=root)
+    dataset   = PygNodePropPredDataset(name='ogbn-mag', root=f'{root}/ogbn-mag')
     data      = dataset[0]
     split_idx = dataset.get_idx_split()
 
