@@ -12,7 +12,12 @@ ogb               # ogbn-mag  (pip install ogb)
 
 # ── Large-graph mini-batch sampling ──────────────────────────────────────────
 # Required by NeighborLoader for graphs with >100k nodes (AMiner, ogbn-mag).
-# Install ONE of the following (torch-sparse is simpler):
-#   pip install torch-sparse
-#   pip install pyg-lib -f https://data.pyg.org/whl/torch-X.Y.Z+cuZZZ.html
+# torch-scatter must be installed BEFORE torch-sparse (it is a hard dependency).
+# Use the version-specific wheel index to avoid ABI mismatches:
+#
+#   pip install torch-scatter torch-sparse \
+#       -f https://data.pyg.org/whl/torch-X.Y.Z+cuZZZ.html
+#
+# Find your versions:  python -c "import torch; print(torch.__version__, torch.version.cuda)"
+# torch-scatter
 # torch-sparse
