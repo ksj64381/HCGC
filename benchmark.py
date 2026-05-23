@@ -173,22 +173,57 @@ def load_acm(root):
     target = 'paper'
     n      = data[target].num_nodes
 
-    # Some HGB releases store integer-index tensors instead of bool masks;
-    # normalise to bool so the rest of the pipeline works uniformly.
+    # Normalise: some HGB releases store integer-index tensors, not bool masks.
     for attr in ('train_mask', 'val_mask', 'test_mask'):
         m = getattr(data[target], attr, None)
         if m is not None and m.dtype != torch.bool:
             mask = torch.zeros(n, dtype=torch.bool)
-            mask[m] = True
+            mask[m.long()] = True
             setattr(data[target], attr, mask)
 
-    # Guard: if some y values are -1 (label withheld), restrict masks.
-    if data[target].y is not None and (data[target].y < 0).any():
-        labeled = data[target].y >= 0
+    # Guard: restrict masks to nodes with valid labels (y >= 0).
+    y = data[target].y
+    if y is not None and (y < 0).any():
+        labeled = y >= 0
         for attr in ('train_mask', 'val_mask', 'test_mask'):
             m = getattr(data[target], attr, None)
             if m is not None:
                 setattr(data[target], attr, m & labeled)
+
+    # Reconstruct missing val/test masks (older HGB format only ships train_mask).
+    tr_mask = getattr(data[target], 'train_mask', None)
+    missing = not (hasattr(data[target], 'val_mask') and
+                   data[target].val_mask is not None and
+                   hasattr(data[target], 'test_mask') and
+                   data[target].test_mask is not None)
+    if missing:
+        if tr_mask is None:
+            # No splits at all — create 60/20/20 random split.
+            torch.manual_seed(42)
+            perm = torch.randperm(n)
+            n_tr, n_va = int(0.6 * n), int(0.2 * n)
+            tr_m = torch.zeros(n, dtype=torch.bool)
+            va_m = torch.zeros(n, dtype=torch.bool)
+            te_m = torch.zeros(n, dtype=torch.bool)
+            tr_m[perm[:n_tr]]            = True
+            va_m[perm[n_tr:n_tr + n_va]] = True
+            te_m[perm[n_tr + n_va:]]     = True
+            data[target].train_mask = tr_m
+            data[target].val_mask   = va_m
+            data[target].test_mask  = te_m
+        else:
+            # Have train_mask; split remaining labeled nodes 50/50 → val/test.
+            rest = (y >= 0) & ~tr_mask
+            ids  = rest.nonzero(as_tuple=True)[0]
+            torch.manual_seed(42)
+            perm = torch.randperm(len(ids))
+            n_va = len(ids) // 2
+            va_m = torch.zeros(n, dtype=torch.bool)
+            te_m = torch.zeros(n, dtype=torch.bool)
+            va_m[ids[perm[:n_va]]]  = True
+            te_m[ids[perm[n_va:]]]  = True
+            data[target].val_mask  = va_m
+            data[target].test_mask = te_m
 
     return data, target
 
