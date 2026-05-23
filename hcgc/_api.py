@@ -28,15 +28,14 @@ class HCGCResult:
 
 def compress(
     data,
-    ratio            = 0.1,
-    target_type      = None,
-    pretrain         = True,
-    pretrain_epochs  = 30,
-    device           = 'auto',
-    verbose          = True,
-    mini_batch_size  = 512,
-    num_neighbors    = None,
-    use_soft_labels  = False,
+    ratio           = 0.1,
+    target_type     = None,
+    pretrain        = True,
+    pretrain_epochs = 30,
+    device          = 'auto',
+    verbose         = True,
+    mini_batch_size = 512,
+    num_neighbors   = None,
 ) -> HCGCResult:
     """Compress a heterogeneous graph using HCGC.
 
@@ -63,11 +62,6 @@ def compress(
         num_neighbors   : Neighbours to sample per hop in mini-batch mode.
                           None = auto (10 per hop). Pass a list e.g. [10, 5]
                           to control per-hop sampling and reduce subgraph size.
-        use_soft_labels : If True, supernodes are trained with soft cross-entropy
-                          using the class-proportion distribution of their member
-                          nodes instead of a hard majority-vote label.
-                          Recommended when compression is aggressive (ratio <= 0.1)
-                          to recover accuracy lost from class-mixed supernodes.
 
     Returns:
         HCGCResult with:
@@ -125,8 +119,7 @@ def compress(
     args = _build_args(ratio=ratio, pretrain=pretrain,
                        pretrain_epochs=pretrain_epochs,
                        mini_batch_size=mini_batch_size,
-                       num_neighbors=num_neighbors,
-                       use_soft_labels=use_soft_labels)
+                       num_neighbors=num_neighbors)
 
     # ── Pretrain (or fast-embed) + extract flat arrays ────────────────────────
     _t = time.perf_counter()
@@ -145,7 +138,7 @@ def compress(
     cdata, local_cm, stats = build_compressed_data(
         data, cm,
         ctx['offsets'], ctx['type_boundaries'],
-        use_soft_labels=use_soft_labels,
+        use_soft_labels=False,
         emb_dict=ctx['emb_dict'] if pretrain else None,
     )
     if verbose:
@@ -236,8 +229,7 @@ def _detect_target_type(data, target_type):
 
 
 def _build_args(ratio, pretrain, pretrain_epochs,
-                mini_batch_size=512, num_neighbors=None,
-                use_soft_labels=False):
+                mini_batch_size=512, num_neighbors=None):
     """Build default args namespace for compress()."""
     return types.SimpleNamespace(
         # Coarsening
@@ -281,7 +273,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         epochs                      = 200,
         eval_every                  = 10,
         patience                    = 30,
-        use_soft_labels             = use_soft_labels,
+        use_soft_labels             = False,
         emb_temp                    = 1.0,
         # Graph size
         mini_batch_size             = mini_batch_size,
