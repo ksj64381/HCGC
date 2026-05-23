@@ -416,19 +416,19 @@ def main():
 
         train_speedup = b_t_m / max(tt_m, 1e-6)
         total_speedup = b_t_m / max(tot_m, 1e-6)
-        acc_drop      = b_acc_m - acc_m
+        acc_drop      = acc_m - b_acc_m   # negative = drop
 
         print()
         print(f"  {'─'*58}")
         print(f"  {'Baseline vs HCGC comparison':^58}")
         print(f"  {'─'*58}")
         print(f"  {'':28}  {'Baseline':>10}  {'HCGC':>10}")
-        print(f"  {'Train time (comp. graph only)':<28}  {b_t_m:>9.1f}s  {tt_m:>9.1f}s"
+        print(f"  {'Train time':<28}  {b_t_m:>9.1f}s  {tt_m:>9.1f}s"
               f"  ({train_speedup:.1f}x faster)")
-        print(f"  {'Total time (incl. compress)':<28}  {'—':>10}  {tot_m:>9.1f}s"
-              f"  ({total_speedup:.1f}x vs baseline train)")
+        print(f"  {'Total time (incl. compress)':<28}  {b_t_m:>9.1f}s  {tot_m:>9.1f}s"
+              f"  ({total_speedup:.2f}x)")
         print(f"  {'Test accuracy':<28}  {b_acc_m:>10.4f}  {acc_m:>10.4f}"
-              f"  ({acc_drop:+.4f} drop)")
+              f"  ({acc_drop:+.4f})")
 
     print(f"{'='*W}\n")
 
