@@ -154,7 +154,22 @@ def load_acm(root):
             "Update PyG:  pip install -U torch_geometric"
         )
 
-    data   = HGBDataset(root=f'{root}/HGB', name='HGBn-ACM')[0]
+    # Different PyG releases use different name conventions for HGB datasets.
+    _candidates = ('HGBn-ACM', 'ACM', 'acm')
+    data = None
+    for _name in _candidates:
+        try:
+            data = HGBDataset(root=f'{root}/HGB', name=_name)[0]
+            break
+        except (AssertionError, ValueError):
+            continue
+    if data is None:
+        _avail = list(HGBDataset.names.keys()) if hasattr(HGBDataset, 'names') else '?'
+        sys.exit(
+            f"Could not load ACM from HGBDataset (tried: {_candidates}).\n"
+            f"Available HGB dataset names in your PyG version: {_avail}\n"
+            "Try updating PyG:  pip install -U torch_geometric"
+        )
     target = 'paper'
     n      = data[target].num_nodes
 
