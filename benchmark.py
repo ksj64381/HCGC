@@ -214,9 +214,14 @@ def train_downstream(result, target_type, device_str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256):
-    """Train on the original (uncompressed) graph. Returns (test_acc, elapsed)."""
+    """Train on the original (uncompressed) graph. Returns (test_acc, elapsed).
+
+    Uses a generous patience (= train_epochs // 5) so the model trains until
+    genuine convergence rather than stopping at an early local plateau.
+    """
     return train_on_heterodata(data, target_type, device,
-                               epochs=train_epochs, hidden=train_hidden)
+                               epochs=train_epochs, hidden=train_hidden,
+                               patience=train_epochs // 5)
 
 
 def run_once(data, target_type, ratio, device, pretrain,
@@ -341,18 +346,25 @@ def main():
             print(f"t={t:.1f}s  test_acc={acc:.4f}")
 
     # ── Warmup ────────────────────────────────────────────────────────────────
-    # The first call to hcgc_module (C++ via pybind11) and the first PyTorch
-    # CUDA kernel launch both carry one-time JIT / driver init overhead.
-    # Warmup runs flush this overhead before measurement begins.
-    # We run with pretrain=False so warmup finishes quickly.
+    # Two JIT sources need flushing before measurement:
+    #   1. C++ kernel (hcgc_module): warmed up by pretrain=False run (fast)
+    #   2. GNN pretrain code path:  warmed up by pretrain=True  run (same as timed)
+    # Running both ensures no first-time compilation overhead leaks into results.
     if args.warmup > 0:
-        print(f"\nWarmup  ({args.warmup} run(s), pretrain=False) ...")
+        print(f"\nWarmup  ({args.warmup} run(s)) ...")
         for i in range(args.warmup):
+            # Pass 1: C++ kernel + basic PyTorch ops (fast, no pretrain)
             t_wu = time.perf_counter()
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
                      pretrain=False, verbose=False)
-            print(f"  warmup {i+1}/{args.warmup}  ({time.perf_counter()-t_wu:.1f}s)")
+            print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
+            # Pass 2: GNN pretrain code path (same config as timed runs)
+            t_wu = time.perf_counter()
+            run_once(data, target_type,
+                     ratio=args.ratio, device=args.device,
+                     pretrain=pretrain, verbose=False)
+            print(f"  warmup {i+1}/{args.warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Timed runs ────────────────────────────────────────────────────────────
     print(f"\nTimed runs ({args.runs}) ...")
