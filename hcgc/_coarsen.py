@@ -298,6 +298,15 @@ class _SuppressCStdout:
     def __exit__(self, *_):
         if getattr(self, '_active', False):
             try:
+                # Flush the C stdio buffer (printf/cout) to /dev/null BEFORE
+                # restoring fd 1.  Without this, any unflushed C output that
+                # is still in the C runtime buffer would be written to the
+                # restored real stdout after dup2.
+                try:
+                    import ctypes
+                    ctypes.CDLL(None).fflush(None)
+                except Exception:
+                    pass
                 os.dup2(self._old_fd, 1)
                 os.close(self._old_fd)
                 os.close(self._devnull)
