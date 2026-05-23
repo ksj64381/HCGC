@@ -151,7 +151,7 @@ def train_on_heterodata(data, target_type, device_str,
     dev = torch.device(
         ('cuda' if torch.cuda.is_available() else 'cpu')
         if device_str == 'auto' else device_str)
-    cdata = data.to(dev)
+    cdata = data.clone().to(dev)  # clone: PyG .to() is in-place, original must stay on CPU
 
     feat_dims = {
         nt: cdata[nt].x.shape[1]
