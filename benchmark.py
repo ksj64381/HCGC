@@ -225,7 +225,8 @@ def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256):
 
 
 def run_once(data, target_type, ratio, device, pretrain,
-             train_epochs=200, train_hidden=256, verbose=False):
+             train_epochs=200, train_hidden=256, verbose=False,
+             use_soft_labels=False):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
@@ -236,11 +237,12 @@ def run_once(data, target_type, ratio, device, pretrain,
         warnings.simplefilter('ignore')
         result = hcgc.compress(
             data,
-            ratio       = ratio,
-            target_type = target_type,
-            pretrain    = pretrain,
-            device      = device,
-            verbose     = verbose,
+            ratio            = ratio,
+            target_type      = target_type,
+            pretrain         = pretrain,
+            device           = device,
+            verbose          = verbose,
+            use_soft_labels  = use_soft_labels,
         )
     t_compress = time.perf_counter() - t0
 
@@ -306,6 +308,10 @@ def main():
                         help='Hidden dim for downstream GNN')
     parser.add_argument('--baseline', action='store_true',
                         help='Also train on the original graph and print speedup comparison')
+    parser.add_argument('--soft-labels', action='store_true',
+                        help='Train supernodes with soft cross-entropy (class-proportion '
+                             'distribution) instead of hard majority-vote labels. '
+                             'Recommended at aggressive ratios (<=0.1).')
     args = parser.parse_args()
 
     pretrain = not args.no_pretrain
@@ -357,13 +363,15 @@ def main():
             t_wu = time.perf_counter()
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
-                     pretrain=False, verbose=False)
+                     pretrain=False, verbose=False,
+                     use_soft_labels=args.soft_labels)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
-                     pretrain=pretrain, verbose=False)
+                     pretrain=pretrain, verbose=False,
+                     use_soft_labels=args.soft_labels)
             print(f"  warmup {i+1}/{args.warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Timed runs ────────────────────────────────────────────────────────────
@@ -373,12 +381,13 @@ def main():
         print(f"  run {i+1}/{args.runs} ... ", end='', flush=True)
         r = run_once(
             data, target_type,
-            ratio        = args.ratio,
-            device       = args.device,
-            pretrain     = pretrain,
-            train_epochs = args.train_epochs,
-            train_hidden = args.train_hidden,
-            verbose      = False,
+            ratio            = args.ratio,
+            device           = args.device,
+            pretrain         = pretrain,
+            train_epochs     = args.train_epochs,
+            train_hidden     = args.train_hidden,
+            verbose          = False,
+            use_soft_labels  = args.soft_labels,
         )
         records.append(r)
         print(
