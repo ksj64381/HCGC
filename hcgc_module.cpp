@@ -372,9 +372,9 @@ struct CSRGraph {
     const int progress_step = std::max(1, num_nodes / 20);
     for (int u = 0; u < num_nodes; ++u) {
       if (u % progress_step == 0) {
-        std::cout << "\r[HCGC] build_coarsened_data: " << u << "/" << num_nodes
-                  << " (" << (100 * u / num_nodes) << "%)  "
-                  << "edges so far: " << edge_map.size() << "   ";
+        std::cout << "\r[HCGC] build_coarsened_data:\t" << u << "/" << num_nodes
+                  << " (" << (100 * u / num_nodes) << "%)\tedges so far: "
+                  << edge_map.size() << "        ";
         std::cout.flush();
       }
       int nu = cd.old_to_new[find_root(u)];
@@ -389,8 +389,8 @@ struct CSRGraph {
         edge_map[key] += edge_weight[e];
       }
     }
-    std::cout << "\r[HCGC] build_coarsened_data: " << num_nodes << "/" << num_nodes
-              << " (100%)  total edges: " << edge_map.size() << "   \n";
+    std::cout << "\r[HCGC] build_coarsened_data:\t" << num_nodes << "/" << num_nodes
+              << " (100%)\ttotal edges: " << edge_map.size() << "        \n";
     std::cout.flush();
     cd.src.reserve(edge_map.size());
     cd.dst.reserve(edge_map.size());
@@ -626,9 +626,6 @@ struct CSRGraph {
                     [](const auto &a, const auto &b){ return a.first > b.first; });
 
           int total_merges = 0;
-          std::cout << " [HCGC] outer=" << (outer_idx+1) << " pass=" << (pass+1)
-                    << " t_src=" << t_src << " via t_med=" << t_med
-                    << " | " << leaders.size() << " mediators\n";
 
           for (size_t li = 0; li < leaders.size(); ++li) {
             int m = leaders[li].second;
@@ -772,12 +769,17 @@ struct CSRGraph {
               }
             }
           }
-          std::cout << "   -> " << total_merges << " merges (Ball Multi-Merge)\n";
+          std::cout << "\r  [outer " << (outer_idx+1)
+                    << " | pass " << (pass+1) << "/" << inner_passes
+                    << "]\tsrc=" << t_src << " med=" << t_med
+                    << ":\t" << total_merges << " merges\t("
+                    << merges_this_outer << " total)        ";
+          std::cout.flush();
         } // t_med
       }   // t_src
     }     // inner pass
 
-    std::cout << "[HCGC] Inner passes done: " << merges_this_outer << " merges\n";
+    std::cout << "\n[HCGC] Inner passes done:\t" << merges_this_outer << " merges\n";
     std::cout.flush();
 
     // ── Finalize merged roots ─────────────────────────────────────────────
