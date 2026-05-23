@@ -167,10 +167,42 @@ def load_acm(root):
 
     if not os.path.exists(mat_path):
         os.makedirs(acm_root, exist_ok=True)
-        url      = 'https://data.dgl.ai/dataset/ACM.zip'
         zip_path = os.path.join(acm_root, 'ACM.zip')
-        print(f'  Downloading ACM from {url} ...')
-        urllib.request.urlretrieve(url, zip_path)
+
+        _mirrors = [
+            'https://data.dgl.ai/dataset/ACM.zip',
+            'https://dgl-data.s3-accelerate.amazonaws.com/dataset/ACM.zip',
+            'https://dgl-data.s3.us-west-2.amazonaws.com/dataset/ACM.zip',
+        ]
+        # Browser-like User-Agent avoids Cloudflare / CDN 403 blocks.
+        _headers = {
+            'User-Agent': ('Mozilla/5.0 (X11; Linux x86_64; rv:115.0) '
+                           'Gecko/20100101 Firefox/115.0')
+        }
+        _downloaded = False
+        for _url in _mirrors:
+            try:
+                print(f'  Downloading ACM from {_url} ...')
+                req = urllib.request.Request(_url, headers=_headers)
+                with urllib.request.urlopen(req, timeout=120) as _resp, \
+                     open(zip_path, 'wb') as _f:
+                    _f.write(_resp.read())
+                _downloaded = True
+                break
+            except Exception as _e:
+                print(f'  Failed ({type(_e).__name__}: {_e}), trying next ...')
+
+        if not _downloaded:
+            sys.exit(
+                "\nAll ACM download mirrors failed.\n\n"
+                "Manual download (choose one):\n"
+                "  https://data.dgl.ai/dataset/ACM.zip\n"
+                "  https://dgl-data.s3-accelerate.amazonaws.com/dataset/ACM.zip\n\n"
+                "Then place ACM.mat at:\n"
+                f"  {mat_path}\n"
+                "(Unzip ACM.zip and move ACM.mat if needed.)"
+            )
+
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(acm_root)
         os.remove(zip_path)
