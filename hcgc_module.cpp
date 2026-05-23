@@ -445,15 +445,13 @@ struct CSRGraph {
 
       int type_n    = src_end - src_start;
       int prog_step = std::max(1, type_n / 10);
-      std::cout << "[HCGC] reassignment_pass type=" << t_src
-                << " (" << type_n << " nodes, dim=" << dim << ")...\n";
-      std::cout.flush();
 
       for (int v = src_start; v < src_end; ++v) {
-        if ((v - src_start) % prog_step == 0 && v > src_start) {
+        if ((v - src_start) % prog_step == 0) {
           int pct = 100 * (v - src_start) / type_n;
-          std::cout << "[HCGC]   reassignment type=" << t_src
-                    << " " << pct << "%  pending=" << pending.size() << "\n";
+          std::cout << "\r[HCGC] reassignment type=" << t_src
+                    << "\t" << pct << "%\tnodes=" << type_n
+                    << "\tpending=" << pending.size() << "        ";
           std::cout.flush();
         }
 
@@ -566,7 +564,7 @@ struct CSRGraph {
     }
 
     normalize_coalition_map();
-    std::cout << "[HCGC] Reassignment: " << total_switches << " switches\n";
+    std::cout << "\n[HCGC] Reassignment:\t" << total_switches << " switches\n";
     return total_switches;
   }
 
