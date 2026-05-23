@@ -22,6 +22,7 @@ import numpy as np
 
 from benchmark import (
     LOADERS,
+    _DOWNSTREAM_MODELS,
     _add_degree_features,
     _FULL_BATCH_NODE_LIMIT,
     run_baseline,
@@ -35,7 +36,7 @@ from benchmark import (
 
 def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
               pretrain=True, train_epochs=200, train_hidden=256,
-              mini_batch_size=512, baseline=True):
+              mini_batch_size=512, model_name='sage', baseline=True):
     """Run compress→train for each ratio and return collected stats.
 
     Returns
@@ -49,6 +50,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     print(f"{'='*W}")
     print(f"  dataset  : {dataset}")
     print(f"  ratios   : {ratios}")
+    print(f"  model    : {model_name}")
     print(f"  pretrain : {pretrain}")
     print(f"  device   : {device}")
     print(f"  runs     : {warmup} warmup  +  {runs} timed")
@@ -77,7 +79,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
             acc, t = run_baseline(data, target_type, device,
                                   train_epochs=train_epochs,
                                   train_hidden=train_hidden,
-                                  mini_batch_size=mini_batch_size)
+                                  mini_batch_size=mini_batch_size,
+                                  model_name=model_name)
             base_recs.append({'test_acc': acc, 't_train': t})
             print(f"t={t:.1f}s  test_acc={acc:.4f}")
         base_stats = {
@@ -96,13 +99,13 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
                      pretrain=False, verbose=False,
-                     mini_batch_size=mini_batch_size)
+                     mini_batch_size=mini_batch_size, model_name=model_name)
             print(f"  warmup {i+1}/{warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
                      pretrain=pretrain, verbose=False,
                      train_epochs=train_epochs, train_hidden=train_hidden,
-                     mini_batch_size=mini_batch_size)
+                     mini_batch_size=mini_batch_size, model_name=model_name)
             print(f"  warmup {i+1}/{warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Ratio sweep ───────────────────────────────────────────────────────────
@@ -121,6 +124,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                 train_hidden    = train_hidden,
                 verbose         = False,
                 mini_batch_size = mini_batch_size,
+                model_name      = model_name,
             )
             recs.append(r)
             print(f"comp={r['compression']:.2f}x  "
@@ -222,6 +226,8 @@ def main():
     parser.add_argument('--train-epochs', type=int, default=200)
     parser.add_argument('--train-hidden', type=int, default=256)
     parser.add_argument('--mini-batch-size', type=int, default=512)
+    parser.add_argument('--model',    default='sage', choices=list(_DOWNSTREAM_MODELS),
+                        help='Downstream GNN architecture for evaluation')
     parser.add_argument('--no-baseline', action='store_true',
                         help='Skip original-graph baseline training')
     args = parser.parse_args()
@@ -239,6 +245,7 @@ def main():
         train_epochs    = args.train_epochs,
         train_hidden    = args.train_hidden,
         mini_batch_size = args.mini_batch_size,
+        model_name      = args.model,
         baseline        = not args.no_baseline,
     )
 

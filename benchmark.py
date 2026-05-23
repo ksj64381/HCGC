@@ -345,9 +345,10 @@ LOADERS = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _HeteroSAGE(torch.nn.Module):
-    """Two-layer HeteroSAGE used for downstream evaluation on compressed graphs."""
+    """GraphSAGE adapted for heterogeneous graphs via HeteroConv."""
 
-    def __init__(self, edge_types, feat_dims, hidden, num_classes, dropout=0.5):
+    def __init__(self, edge_types, feat_dims, hidden, num_classes, dropout=0.5,
+                 num_layers=2):
         super().__init__()
         import inspect
         kw = {'add_self_loops': False} if 'add_self_loops' in \
@@ -361,19 +362,150 @@ class _HeteroSAGE(torch.nn.Module):
             return HeteroConv(
                 {et: SAGEConv(hidden, hidden, **kw) for et in edge_types},
                 aggr='mean')
-        self.conv1 = _conv()
-        self.conv2 = _conv()
+        self.convs = torch.nn.ModuleList([_conv() for _ in range(num_layers)])
         self.clf   = torch.nn.Linear(hidden, num_classes)
         self.drop  = torch.nn.Dropout(dropout)
+        self.num_layers = num_layers
 
     def forward(self, x_dict, edge_index_dict, target_type):
         h = {nt: F.relu(self.proj[nt.replace('.', '_')](x))
              for nt, x in x_dict.items()
              if nt.replace('.', '_') in self.proj}
-        h = self.conv1(h, edge_index_dict)
-        h = {k: F.relu(self.drop(v)) for k, v in h.items() if v is not None}
-        h = self.conv2(h, edge_index_dict)
+        for i, conv in enumerate(self.convs):
+            h = conv(h, edge_index_dict)
+            if i < self.num_layers - 1:
+                h = {k: F.relu(self.drop(v)) for k, v in h.items() if v is not None}
         return self.clf(h[target_type])
+
+
+class _DownstreamHGT(torch.nn.Module):
+    """Heterogeneous Graph Transformer (Hu et al., WWW 2020).
+
+    Uses type-dependent attention weights; handles any number of node/edge types
+    without per-type weight explosion via a shared projection.
+    """
+
+    def __init__(self, data, hidden, num_classes, dropout=0.5,
+                 num_layers=2, num_heads=2):
+        from torch_geometric.nn import HGTConv
+        super().__init__()
+        self._ntypes = [nt for nt in data.node_types
+                        if hasattr(data[nt], 'x') and data[nt].x is not None]
+        self.proj = torch.nn.ModuleDict({
+            nt.replace('.', '_'): torch.nn.Linear(data[nt].x.shape[1], hidden)
+            for nt in self._ntypes
+        })
+        self.convs = torch.nn.ModuleList([
+            HGTConv(hidden, hidden, data.metadata(), num_heads)
+            for _ in range(num_layers)
+        ])
+        self.clf  = torch.nn.Linear(hidden, num_classes)
+        self.drop = torch.nn.Dropout(dropout)
+        self.num_layers = num_layers
+
+    def forward(self, x_dict, edge_index_dict, target_type):
+        h = {nt: F.relu(self.proj[nt.replace('.', '_')](x))
+             for nt, x in x_dict.items() if nt in self._ntypes}
+        for i, conv in enumerate(self.convs):
+            h_new = conv(h, edge_index_dict)
+            h = {k: (F.relu(self.drop(h_new[k])) if (h_new.get(k) is not None
+                     and i < self.num_layers - 1)
+                     else (h_new[k] if h_new.get(k) is not None else h[k]))
+                 for k in h}
+        return self.clf(h[target_type])
+
+
+class _DownstreamGAT(torch.nn.Module):
+    """Heterogeneous GAT: GATConv per relation type, wrapped in HeteroConv.
+
+    Uses concat=False (mean over heads) so the hidden dimension stays constant
+    across all layers regardless of the number of attention heads.
+    """
+
+    def __init__(self, data, hidden, num_classes, dropout=0.5,
+                 num_layers=2, num_heads=4):
+        from torch_geometric.nn import GATConv
+        super().__init__()
+        self._ntypes = [nt for nt in data.node_types
+                        if hasattr(data[nt], 'x') and data[nt].x is not None]
+        self.proj = torch.nn.ModuleDict({
+            nt.replace('.', '_'): torch.nn.Linear(data[nt].x.shape[1], hidden)
+            for nt in self._ntypes
+        })
+        def _make():
+            return HeteroConv(
+                {et: GATConv(hidden, hidden, heads=num_heads,
+                             concat=False, dropout=dropout, add_self_loops=False)
+                 for et in data.edge_types},
+                aggr='mean')
+        self.convs = torch.nn.ModuleList([_make() for _ in range(num_layers)])
+        self.clf  = torch.nn.Linear(hidden, num_classes)
+        self.drop = torch.nn.Dropout(dropout)
+        self.num_layers = num_layers
+
+    def forward(self, x_dict, edge_index_dict, target_type):
+        h = {nt: F.relu(self.proj[nt.replace('.', '_')](x))
+             for nt, x in x_dict.items() if nt in self._ntypes}
+        for i, conv in enumerate(self.convs):
+            h = conv(h, edge_index_dict)
+            if i < self.num_layers - 1:
+                h = {k: F.relu(self.drop(v)) for k, v in h.items() if v is not None}
+        return self.clf(h[target_type])
+
+
+class _DownstreamRGCN(torch.nn.Module):
+    """Relational GCN (Schlichtkrull et al., ESWC 2018).
+
+    A separate GraphConv weight matrix per relation type, aggregated with sum.
+    """
+
+    def __init__(self, data, hidden, num_classes, dropout=0.5, num_layers=2):
+        from torch_geometric.nn import GraphConv
+        super().__init__()
+        self._ntypes = [nt for nt in data.node_types
+                        if hasattr(data[nt], 'x') and data[nt].x is not None]
+        self.proj = torch.nn.ModuleDict({
+            nt.replace('.', '_'): torch.nn.Linear(data[nt].x.shape[1], hidden)
+            for nt in self._ntypes
+        })
+        def _make():
+            return HeteroConv(
+                {et: GraphConv(hidden, hidden) for et in data.edge_types},
+                aggr='sum')
+        self.convs = torch.nn.ModuleList([_make() for _ in range(num_layers)])
+        self.clf  = torch.nn.Linear(hidden, num_classes)
+        self.drop = torch.nn.Dropout(dropout)
+        self.num_layers = num_layers
+
+    def forward(self, x_dict, edge_index_dict, target_type):
+        h = {nt: F.relu(self.proj[nt.replace('.', '_')](x))
+             for nt, x in x_dict.items() if nt in self._ntypes}
+        for i, conv in enumerate(self.convs):
+            h = conv(h, edge_index_dict)
+            if i < self.num_layers - 1:
+                h = {k: F.relu(self.drop(v)) for k, v in h.items() if v is not None}
+        return self.clf(h[target_type])
+
+
+_DOWNSTREAM_MODELS = ('sage', 'hgt', 'gat', 'rgcn')
+
+
+def _build_downstream_model(data, target_type, model_name, hidden, num_classes,
+                             dropout=0.5, dev=None):
+    """Factory: instantiate a downstream GNN by name and move to device."""
+    model_name = model_name.lower()
+    if model_name == 'hgt':
+        m = _DownstreamHGT(data, hidden, num_classes, dropout)
+    elif model_name == 'gat':
+        m = _DownstreamGAT(data, hidden, num_classes, dropout)
+    elif model_name == 'rgcn':
+        m = _DownstreamRGCN(data, hidden, num_classes, dropout)
+    else:   # 'sage' (default)
+        feat_dims = {nt: data[nt].x.shape[1]
+                     for nt in data.node_types
+                     if hasattr(data[nt], 'x') and data[nt].x is not None}
+        m = _HeteroSAGE(data.edge_types, feat_dims, hidden, num_classes, dropout)
+    return m if dev is None else m.to(dev)
 
 
 # Total-node threshold above which full-batch GNN training is replaced
@@ -384,6 +516,7 @@ _FULL_BATCH_NODE_LIMIT = 100_000
 def _train_mini_batch_downstream(data, target_type, device_str,
                                   epochs=200, lr=1e-3, patience=30,
                                   hidden=256, batch_size=512,
+                                  model_name='sage',
                                   orig_data=None, node_map=None):
     """Mini-batch HeteroSAGE training via NeighborLoader.
 
@@ -435,13 +568,9 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         ('cuda' if torch.cuda.is_available() else 'cpu')
         if device_str == 'auto' else device_str)
 
-    feat_dims = {
-        nt: data[nt].x.shape[1]
-        for nt in data.node_types
-        if hasattr(data[nt], 'x') and data[nt].x is not None
-    }
     num_classes = int(data[target_type].y.max().item()) + 1
-    model = _HeteroSAGE(data.edge_types, feat_dims, hidden, num_classes).to(dev)
+    model = _build_downstream_model(data, target_type, model_name,
+                                    hidden, num_classes, dev=dev)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
     num_neighbors = [10, 10]   # 2 hops, 10 neighbours per edge type per hop
@@ -551,7 +680,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
 
 def train_on_heterodata(data, target_type, device_str,
                         epochs=200, lr=1e-3, patience=30, hidden=256,
-                        mini_batch_size=512,
+                        mini_batch_size=512, model_name='sage',
                         orig_data=None, node_map=None):
     """Train a 2-layer HeteroSAGE on any HeteroData object.
 
@@ -575,6 +704,7 @@ def train_on_heterodata(data, target_type, device_str,
             data, target_type, device_str,
             epochs=epochs, lr=lr, patience=patience, hidden=hidden,
             batch_size=mini_batch_size,
+            model_name=model_name,
             orig_data=orig_data, node_map=node_map,
         )
 
@@ -583,14 +713,9 @@ def train_on_heterodata(data, target_type, device_str,
         if device_str == 'auto' else device_str)
     cdata = data.clone().to(dev)  # clone: PyG .to() is in-place, original must stay on CPU
 
-    feat_dims = {
-        nt: cdata[nt].x.shape[1]
-        for nt in cdata.node_types
-        if hasattr(cdata[nt], 'x') and cdata[nt].x is not None
-    }
     num_classes = int(cdata[target_type].y.max().item()) + 1
-
-    model = _HeteroSAGE(cdata.edge_types, feat_dims, hidden, num_classes).to(dev)
+    model = _build_downstream_model(cdata, target_type, model_name,
+                                    hidden, num_classes, dev=dev)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_val, best_test = 0.0, 0.0
@@ -658,7 +783,7 @@ def train_on_heterodata(data, target_type, device_str,
 
 def train_downstream(result, orig_data, target_type, device_str,
                      epochs=200, lr=1e-3, patience=30, hidden=256,
-                     mini_batch_size=512):
+                     mini_batch_size=512, model_name='sage'):
     """Train on a compressed HCGCResult; evaluate on original test-node labels.
 
     Passes orig_data + result.node_map so the final accuracy is computed by
@@ -668,6 +793,7 @@ def train_downstream(result, orig_data, target_type, device_str,
     return train_on_heterodata(result.data, target_type, device_str,
                                epochs=epochs, lr=lr, patience=patience,
                                hidden=hidden, mini_batch_size=mini_batch_size,
+                               model_name=model_name,
                                orig_data=orig_data, node_map=result.node_map)
 
 
@@ -676,7 +802,7 @@ def train_downstream(result, orig_data, target_type, device_str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
-                 mini_batch_size=512):
+                 mini_batch_size=512, model_name='sage'):
     """Train on the original (uncompressed) graph. Returns (test_acc, elapsed).
 
     Uses a generous patience (= train_epochs // 5) so the model trains until
@@ -686,12 +812,13 @@ def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
     return train_on_heterodata(data, target_type, device,
                                epochs=train_epochs, hidden=train_hidden,
                                patience=train_epochs // 5,
-                               mini_batch_size=mini_batch_size)
+                               mini_batch_size=mini_batch_size,
+                               model_name=model_name)
 
 
 def run_once(data, target_type, ratio, device, pretrain,
              train_epochs=200, train_hidden=256, verbose=False,
-             mini_batch_size=512):
+             mini_batch_size=512, model_name='sage'):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
@@ -719,6 +846,7 @@ def run_once(data, target_type, ratio, device, pretrain,
         epochs          = train_epochs,
         hidden          = train_hidden,
         mini_batch_size = mini_batch_size,
+        model_name      = model_name,
     )
 
     n_orig = result.info['n_nodes_orig']
@@ -776,6 +904,8 @@ def main():
     parser.add_argument('--mini-batch-size', type=int, default=512,
                         help='Seed-node batch size for downstream GNN training on large graphs '
                              '(>100 k nodes). Reduce if GPU OOM on dense graphs.')
+    parser.add_argument('--model',    default='sage', choices=list(_DOWNSTREAM_MODELS),
+                        help='Downstream GNN architecture for evaluation')
     parser.add_argument('--baseline', action='store_true',
                         help='Also train on the original graph and print speedup comparison')
     args = parser.parse_args()
@@ -789,6 +919,7 @@ def main():
     print(f"{'='*W}")
     print(f"  dataset  : {args.dataset}")
     print(f"  ratio    : {args.ratio}  ({1/args.ratio:.1f}x target compression)")
+    print(f"  model    : {args.model}")
     print(f"  pretrain : {pretrain}")
     print(f"  device   : {args.device}")
     print(f"  runs     : {args.warmup} warmup  +  {args.runs} timed")
@@ -817,7 +948,8 @@ def main():
             acc, t = run_baseline(data, target_type, args.device,
                                   train_epochs=args.train_epochs,
                                   train_hidden=args.train_hidden,
-                                  mini_batch_size=args.mini_batch_size)
+                                  mini_batch_size=args.mini_batch_size,
+                                  model_name=args.model)
             base_records.append({'t_train': t, 'test_acc': acc})
             print(f"t={t:.1f}s  test_acc={acc:.4f}")
 
@@ -834,14 +966,16 @@ def main():
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
                      pretrain=False, verbose=False,
-                     mini_batch_size=args.mini_batch_size)
+                     mini_batch_size=args.mini_batch_size,
+                     model_name=args.model)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
             run_once(data, target_type,
                      ratio=args.ratio, device=args.device,
                      pretrain=pretrain, verbose=False,
-                     mini_batch_size=args.mini_batch_size)
+                     mini_batch_size=args.mini_batch_size,
+                     model_name=args.model)
             print(f"  warmup {i+1}/{args.warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Timed runs ────────────────────────────────────────────────────────────
@@ -858,6 +992,7 @@ def main():
             train_hidden    = args.train_hidden,
             verbose         = False,
             mini_batch_size = args.mini_batch_size,
+            model_name      = args.model,
         )
         records.append(r)
         print(
