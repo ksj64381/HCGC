@@ -31,7 +31,7 @@ def compress(
     ratio           = 0.1,
     target_type     = None,
     pretrain        = True,
-    pretrain_epochs = 30,
+    pretrain_epochs = 100,
     device          = 'auto',
     verbose         = True,
     mini_batch_size = 512,
@@ -51,8 +51,9 @@ def compress(
                           before coarsening. Recommended for higher quality.
                           Graphs with >100k nodes automatically use mini-batch
                           training to avoid GPU OOM.
-        pretrain_epochs : Number of pretrain epochs (used when pretrain=True and
+        pretrain_epochs : Max pretrain epochs (used when pretrain=True and
                           the graph is small enough for full-batch training).
+                          Early stopping applies; actual epochs may be fewer.
         device          : Compute device: 'auto', 'cpu', or 'cuda'.
                           'auto' selects CUDA if available.
         verbose         : Print progress messages.
@@ -257,7 +258,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         use_emb_coarsen             = pretrain,
         emb_method                  = 'gnn',
         pretrain_epochs             = pretrain_epochs,
-        pretrain_patience           = 0,
+        pretrain_patience           = 5,
         pretrain_hidden             = None,
         emb_mode                    = 'conv',
         fast_embed                  = False,
