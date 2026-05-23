@@ -98,42 +98,103 @@ def load_ogbn_mag(root):
 
 
 def load_aminer(root):
-    """AMiner citation network (via torch_geometric.datasets.AMiner).
+    """AMiner-small: labeled authors + their 1-hop paper/venue neighborhood.
 
-    Node types : author (6 564), paper (12 499), venue (35).
+    PyG's full AMiner has 4.9 M nodes (the complete AMiner academic
+    knowledge base).  This loader extracts the benchmark-sized subset by
+    keeping only the ~6 564 labeled author nodes and the paper / venue
+    nodes reachable in one hop, giving a graph of roughly 15–25 k nodes —
+    comparable to the small AMiner used in HAN / MAGNN papers.
+
+    Node types : author (~6 564), paper (subset), venue (subset).
     Target     : author, 4-class research area.
-    Splits     : creates a 60 / 20 / 20 random split (seed=42) on
-                 authors when the dataset does not supply masks.
-    Features   : paper nodes have TF-IDF features; author & venue
-                 nodes have no raw features (log-degree injected by
-                 _add_degree_features before compression).
+    Splits     : 60 / 20 / 20 random split (seed=42) on labeled authors.
     """
     from torch_geometric.datasets import AMiner
-    data   = AMiner(root=f'{root}/AMiner')[0]
+    from torch_geometric.data import HeteroData
+
+    full   = AMiner(root=f'{root}/AMiner')[0]
     target = 'author'
-    n      = data[target].num_nodes
 
-    if not (hasattr(data[target], 'y') and data[target].y is not None):
-        raise RuntimeError(
-            "AMiner 'author' nodes have no .y labels — "
-            "check your torch_geometric installation or re-download."
-        )
+    y_full = full[target].y
+    if y_full is None:
+        raise RuntimeError("AMiner 'author' nodes have no .y labels.")
 
-    # Create 60/20/20 split if the dataset does not ship with masks
-    if not (hasattr(data[target], 'train_mask')
-            and data[target].train_mask is not None):
-        torch.manual_seed(42)
-        perm  = torch.randperm(n)
-        n_tr, n_va = int(0.6 * n), int(0.2 * n)
-        tr = torch.zeros(n, dtype=torch.bool)
-        va = torch.zeros(n, dtype=torch.bool)
-        te = torch.zeros(n, dtype=torch.bool)
-        tr[perm[:n_tr]]            = True
-        va[perm[n_tr:n_tr + n_va]] = True
-        te[perm[n_tr + n_va:]]     = True
-        data[target].train_mask = tr
-        data[target].val_mask   = va
-        data[target].test_mask  = te
+    # ── Step 1: keep only labeled authors (y >= 0) ────────────────────────
+    labeled_mask = y_full >= 0
+    labeled_ids  = labeled_mask.nonzero(as_tuple=True)[0]   # old → kept
+    a_old2new    = torch.full((full[target].num_nodes,), -1, dtype=torch.long)
+    a_old2new[labeled_ids] = torch.arange(len(labeled_ids))
+
+    # ── Step 2: collect papers linked to labeled authors ──────────────────
+    paper_keep = torch.zeros(full['paper'].num_nodes, dtype=torch.bool)
+    for et in full.edge_types:
+        src_t, _, dst_t = et
+        ei = full[et].edge_index
+        if src_t == 'author' and dst_t == 'paper':
+            paper_keep[ei[1, labeled_mask[ei[0]]]] = True
+        if src_t == 'paper' and dst_t == 'author':
+            paper_keep[ei[0, labeled_mask[ei[1]]]] = True
+
+    paper_ids   = paper_keep.nonzero(as_tuple=True)[0]
+    p_old2new   = torch.full((full['paper'].num_nodes,), -1, dtype=torch.long)
+    p_old2new[paper_ids] = torch.arange(len(paper_ids))
+
+    # ── Step 3: collect venues linked to kept papers ──────────────────────
+    venue_keep = torch.zeros(full['venue'].num_nodes, dtype=torch.bool)
+    for et in full.edge_types:
+        src_t, _, dst_t = et
+        ei = full[et].edge_index
+        if src_t == 'paper' and dst_t == 'venue':
+            venue_keep[ei[1, paper_keep[ei[0]]]] = True
+        if src_t == 'venue' and dst_t == 'paper':
+            venue_keep[ei[0, paper_keep[ei[1]]]] = True
+
+    venue_ids  = venue_keep.nonzero(as_tuple=True)[0]
+    v_old2new  = torch.full((full['venue'].num_nodes,), -1, dtype=torch.long)
+    v_old2new[venue_ids] = torch.arange(len(venue_ids))
+
+    old2new = {'author': a_old2new, 'paper': p_old2new, 'venue': v_old2new}
+
+    # ── Step 4: build filtered HeteroData ────────────────────────────────
+    data = HeteroData()
+
+    # Node features / labels
+    for nt, ids in [('author', labeled_ids),
+                    ('paper',  paper_ids),
+                    ('venue',  venue_ids)]:
+        if hasattr(full[nt], 'x') and full[nt].x is not None:
+            data[nt].x = full[nt].x[ids]
+        data[nt].num_nodes = len(ids)
+    data['author'].y = y_full[labeled_ids]
+
+    # Edges: remap and drop edges involving removed nodes
+    for et in full.edge_types:
+        src_t, rel, dst_t = et
+        if src_t not in old2new or dst_t not in old2new:
+            continue
+        ei  = full[et].edge_index
+        src_new = old2new[src_t][ei[0]]
+        dst_new = old2new[dst_t][ei[1]]
+        keep    = (src_new >= 0) & (dst_new >= 0)
+        if keep.any():
+            data[et].edge_index = torch.stack(
+                [src_new[keep], dst_new[keep]])
+
+    # ── Step 5: 60/20/20 split on labeled authors ─────────────────────────
+    n = len(labeled_ids)
+    torch.manual_seed(42)
+    perm  = torch.randperm(n)
+    n_tr, n_va = int(0.6 * n), int(0.2 * n)
+    tr = torch.zeros(n, dtype=torch.bool)
+    va = torch.zeros(n, dtype=torch.bool)
+    te = torch.zeros(n, dtype=torch.bool)
+    tr[perm[:n_tr]]            = True
+    va[perm[n_tr:n_tr + n_va]] = True
+    te[perm[n_tr + n_va:]]     = True
+    data[target].train_mask = tr
+    data[target].val_mask   = va
+    data[target].test_mask  = te
 
     return data, target
 
