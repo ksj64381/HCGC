@@ -92,8 +92,6 @@ def load_ogbn_mag(root):
     if data['paper'].y.dim() == 2:
         data['paper'].y = data['paper'].y.squeeze(1)
 
-    # author / institution / field_of_study have no features → add log-degree
-    data = _add_degree_features(data)
     return data, 'paper'
 
 

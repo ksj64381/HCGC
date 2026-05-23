@@ -82,6 +82,12 @@ def compress(
         dev_str = str(device)
     _cfg_mod.set_device(dev_str)
 
+    # ── Ensure all node types have feature tensors ────────────────────────────
+    # Some datasets (e.g. DBLP 'conference', ogbn-mag non-paper types) ship
+    # without node features.  Inject a 1-D log-degree feature so the pipeline
+    # never sees a missing x.
+    data = _ensure_node_features(data)
+
     # ── Configure _CFG from the provided HeteroData ──────────────────────────
     _CFG.node_types  = list(data.node_types)
     _CFG.target_type = _detect_target_type(data, target_type)
@@ -142,6 +148,28 @@ def compress(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _ensure_node_features(data):
+    """Inject log-degree features for node types that have no x tensor.
+
+    Some datasets ship without features for certain node types
+    (e.g. DBLP 'conference', ogbn-mag author/institution/field_of_study).
+    A 1-D log-degree feature is a cheap structural signal that keeps the
+    coarsening kernel from crashing on a missing attribute.
+    """
+    for nt in data.node_types:
+        if hasattr(data[nt], 'x') and data[nt].x is not None:
+            continue
+        n = data[nt].num_nodes
+        deg = torch.zeros(n, dtype=torch.float)
+        for et in data.edge_types:
+            _, _, d_type = et
+            if d_type == nt:
+                ei = data[et].edge_index
+                deg.scatter_add_(0, ei[1], torch.ones(ei.shape[1]))
+        data[nt].x = (deg + 1.0).log().unsqueeze(1)  # shape [N, 1]
+    return data
+
 
 def _detect_target_type(data, target_type):
     if target_type is not None:
