@@ -383,7 +383,8 @@ _FULL_BATCH_NODE_LIMIT = 100_000
 
 def _train_mini_batch_downstream(data, target_type, device_str,
                                   epochs=200, lr=1e-3, patience=30,
-                                  hidden=256, batch_size=512):
+                                  hidden=256, batch_size=512,
+                                  orig_data=None, node_map=None):
     """Mini-batch HeteroSAGE training via NeighborLoader.
 
     Used automatically by train_on_heterodata when the graph has more than
@@ -480,6 +481,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         return correct / max(total, 1)
 
     best_val, best_test = 0.0, 0.0
+    best_state          = None
     no_improve          = 0
     eval_every          = 10
     patience_steps      = max(patience // eval_every, 1)
@@ -503,22 +505,64 @@ def _train_mini_batch_downstream(data, target_type, device_str,
 
             if val_acc > best_val:
                 best_val, best_test, no_improve = val_acc, test_acc, 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 no_improve += 1
 
             if no_improve >= patience_steps:
                 break
 
-    return best_test, time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
+
+    # Restore best checkpoint
+    if best_state is not None:
+        model.load_state_dict({k: v.to(dev) for k, v in best_state.items()})
+
+    # -- Original-node evaluation (maps supernode predictions -> original labels) --
+    if orig_data is not None and node_map is not None and target_type in node_map:
+        from torch_geometric.loader import NeighborLoader
+        n_target = data[target_type].num_nodes
+        inf_loader = NeighborLoader(
+            data,
+            num_neighbors   = [10, 10],
+            batch_size      = batch_size * 4,
+            input_nodes     = (target_type, torch.ones(n_target, dtype=torch.bool)),
+            shuffle         = False,
+        )
+        preds = torch.empty(n_target, dtype=torch.long)
+        model.eval()
+        with torch.no_grad():
+            for batch in inf_loader:
+                batch = batch.to(dev)
+                out   = model(batch.x_dict, batch.edge_index_dict, target_type)
+                bs    = batch[target_type].batch_size
+                pred  = out[:bs].argmax(1).cpu()
+                nids  = batch[target_type].n_id[:bs].cpu()
+                preds[nids] = pred
+        nm        = node_map[target_type]            # [n_orig] -> supernode idx
+        te_mask   = orig_data[target_type].test_mask
+        y_orig    = orig_data[target_type].y[te_mask]
+        super_idx = nm[te_mask]                      # which supernode each orig test node belongs to
+        orig_acc  = (preds[super_idx] == y_orig).float().mean().item()
+        return orig_acc, elapsed
+
+    return best_test, elapsed
 
 
 def train_on_heterodata(data, target_type, device_str,
                         epochs=200, lr=1e-3, patience=30, hidden=256,
-                        mini_batch_size=512):
+                        mini_batch_size=512,
+                        orig_data=None, node_map=None):
     """Train a 2-layer HeteroSAGE on any HeteroData object.
 
     Automatically switches to mini-batch (NeighborLoader) mode when the
     total node count exceeds _FULL_BATCH_NODE_LIMIT (100 k) to avoid OOM.
+
+    When orig_data and node_map are provided (compress() result), the final
+    test accuracy is computed by mapping supernode predictions back to original
+    test node labels — the same protocol used by HCGC's internal eval_pipeline.
+    This gives a fairer accuracy number than evaluating on majority-vote
+    supernode labels directly.
 
     Returns
     -------
@@ -531,6 +575,7 @@ def train_on_heterodata(data, target_type, device_str,
             data, target_type, device_str,
             epochs=epochs, lr=lr, patience=patience, hidden=hidden,
             batch_size=mini_batch_size,
+            orig_data=orig_data, node_map=node_map,
         )
 
     dev = torch.device(
@@ -549,6 +594,7 @@ def train_on_heterodata(data, target_type, device_str,
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_val, best_test = 0.0, 0.0
+    best_state          = None
     no_improve          = 0          # measured in eval steps, not epochs
     eval_every          = 10
 
@@ -577,22 +623,52 @@ def train_on_heterodata(data, target_type, device_str,
 
             if val_acc > best_val:
                 best_val, best_test, no_improve = val_acc, test_acc, 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 no_improve += 1
 
             if no_improve >= patience // eval_every:
                 break
 
-    return best_test, time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
+
+    # Restore best-val checkpoint (fixes the bug where the final model state
+    # is one early-stopping step past the best-val epoch)
+    if best_state is not None:
+        model.load_state_dict({k: v.to(dev) for k, v in best_state.items()})
+
+    # -- Original-node evaluation (maps supernode predictions -> original labels) --
+    # When orig_data + node_map are supplied (compress() result), evaluate by
+    # propagating supernode predictions back to original test node labels.
+    # This is the same protocol as HCGC's internal eval_compressed_on_original().
+    if orig_data is not None and node_map is not None and target_type in node_map:
+        model.eval()
+        with torch.no_grad():
+            out = model(cdata.x_dict, cdata.edge_index_dict, target_type)
+        nm        = node_map[target_type]            # [n_orig_target] -> supernode index
+        te_mask   = orig_data[target_type].test_mask
+        y_orig    = orig_data[target_type].y[te_mask]
+        super_idx = nm[te_mask].to(dev)
+        pred      = out[super_idx].argmax(1).cpu()
+        orig_acc  = (pred == y_orig).float().mean().item()
+        return orig_acc, elapsed
+
+    return best_test, elapsed
 
 
-def train_downstream(result, target_type, device_str,
+def train_downstream(result, orig_data, target_type, device_str,
                      epochs=200, lr=1e-3, patience=30, hidden=256,
                      mini_batch_size=512):
-    """Thin wrapper: train on a compressed HCGCResult."""
+    """Train on a compressed HCGCResult; evaluate on original test-node labels.
+
+    Passes orig_data + result.node_map so the final accuracy is computed by
+    mapping supernode predictions back to original node labels (the correct
+    protocol for a coarsening benchmark).
+    """
     return train_on_heterodata(result.data, target_type, device_str,
                                epochs=epochs, lr=lr, patience=patience,
-                               hidden=hidden, mini_batch_size=mini_batch_size)
+                               hidden=hidden, mini_batch_size=mini_batch_size,
+                               orig_data=orig_data, node_map=result.node_map)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -635,8 +711,10 @@ def run_once(data, target_type, ratio, device, pretrain,
     t_compress = time.perf_counter() - t0
 
     # ── Downstream training ───────────────────────────────────────────────────
+    # Pass orig_data so train_downstream evaluates on original node labels,
+    # not supernode majority-vote labels.
     test_acc, t_train = train_downstream(
-        result, target_type,
+        result, data, target_type,
         device_str      = device,
         epochs          = train_epochs,
         hidden          = train_hidden,
