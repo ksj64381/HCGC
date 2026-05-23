@@ -243,6 +243,30 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     """
     from torch_geometric.loader import NeighborLoader
 
+    # NeighborLoader needs torch-sparse or pyg-lib for the actual C++ sampling.
+    # Give a clear install hint instead of a cryptic ImportError mid-iteration.
+    _backend_ok = False
+    for _pkg in ('torch_sparse', 'pyg_lib'):
+        try:
+            __import__(_pkg)
+            _backend_ok = True
+            break
+        except ImportError:
+            pass
+    if not _backend_ok:
+        raise ImportError(
+            "\n\nMini-batch training (NeighborLoader) requires 'torch-sparse' "
+            "or 'pyg-lib'.\n"
+            "Quick install (replace torch/CUDA versions as needed):\n\n"
+            "  pip install torch-sparse\n\n"
+            "If that fails, use the version-specific wheel index:\n"
+            "  TORCH=$(python -c \"import torch; print(torch.__version__.split('+')[0])\")\n"
+            "  CUDA=$(python  -c \"import torch; "
+            "print('cu'+torch.version.cuda.replace('.','')[:3])\")\n"
+            "  pip install torch-sparse "
+            "-f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html\n"
+        )
+
     dev = torch.device(
         ('cuda' if torch.cuda.is_available() else 'cpu')
         if device_str == 'auto' else device_str)

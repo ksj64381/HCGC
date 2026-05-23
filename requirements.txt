@@ -9,3 +9,10 @@ pybind11          # C++ kernel build tool
 pandas            # torch_geometric.datasets.AMiner
 scipy             # ACM fallback loader (optional, HGBDataset preferred)
 ogb               # ogbn-mag  (pip install ogb)
+
+# ── Large-graph mini-batch sampling ──────────────────────────────────────────
+# Required by NeighborLoader for graphs with >100k nodes (AMiner, ogbn-mag).
+# Install ONE of the following (torch-sparse is simpler):
+#   pip install torch-sparse
+#   pip install pyg-lib -f https://data.pyg.org/whl/torch-X.Y.Z+cuZZZ.html
+# torch-sparse
