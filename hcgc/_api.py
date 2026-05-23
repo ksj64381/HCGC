@@ -33,6 +33,8 @@ def compress(
     pretrain_epochs = 30,
     device          = 'auto',
     verbose         = True,
+    mini_batch_size = 512,
+    num_neighbors   = None,
 ) -> HCGCResult:
     """Compress a heterogeneous graph using HCGC.
 
@@ -46,13 +48,19 @@ def compress(
                           (looks for the node type with train_mask labels).
         pretrain        : If True, pretrain a GNN to get better node embeddings
                           before coarsening. Recommended for higher quality.
-                          Large graphs (>100k nodes) automatically use fast SGC
-                          propagation instead of full GNN training.
+                          Graphs with >100k nodes automatically use mini-batch
+                          training to avoid GPU OOM.
         pretrain_epochs : Number of pretrain epochs (used when pretrain=True and
                           the graph is small enough for full-batch training).
         device          : Compute device: 'auto', 'cpu', or 'cuda'.
                           'auto' selects CUDA if available.
         verbose         : Print progress messages.
+        mini_batch_size : Seed-node batch size for mini-batch training and
+                          embedding extraction on large graphs (>100k nodes).
+                          Reduce (e.g. 128) if GPU OOM on dense graphs like AMiner.
+        num_neighbors   : Neighbours to sample per hop in mini-batch mode.
+                          None = auto (10 per hop). Pass a list e.g. [10, 5]
+                          to control per-hop sampling and reduce subgraph size.
 
     Returns:
         HCGCResult with:
@@ -103,7 +111,9 @@ def compress(
 
     # ── Build args ────────────────────────────────────────────────────────────
     args = _build_args(ratio=ratio, pretrain=pretrain,
-                       pretrain_epochs=pretrain_epochs)
+                       pretrain_epochs=pretrain_epochs,
+                       mini_batch_size=mini_batch_size,
+                       num_neighbors=num_neighbors)
 
     # ── Pretrain (or fast-embed) + extract flat arrays ────────────────────────
     ctx = _load_and_pretrain(data, args)
@@ -202,7 +212,8 @@ def _detect_target_type(data, target_type):
     )
 
 
-def _build_args(ratio, pretrain, pretrain_epochs):
+def _build_args(ratio, pretrain, pretrain_epochs,
+                mini_batch_size=512, num_neighbors=None):
     """Build default args namespace for compress()."""
     return types.SimpleNamespace(
         # Coarsening
@@ -249,9 +260,9 @@ def _build_args(ratio, pretrain, pretrain_epochs):
         use_soft_labels             = False,
         emb_temp                    = 1.0,
         # Graph size
-        mini_batch_size             = 512,
+        mini_batch_size             = mini_batch_size,
         force_mini_batch            = False,
-        num_neighbors               = None,
+        num_neighbors               = num_neighbors,
         # Misc
         base_seed                   = 42,
         use_label_aware_split       = False,

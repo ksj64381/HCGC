@@ -413,7 +413,7 @@ def _extract_emb_mini_batch(model, data, batch_size=512, num_neighbors=None):
     node_counts = {nt: data[nt].num_nodes for nt in _CFG.node_types}
     total = sum(node_counts.values())
 
-    if total < 500_000:
+    if total < MINI_BATCH_THRESHOLD:
         model.eval()
         with torch.no_grad():
             data_dev = data.to(_cfg.DEVICE)
