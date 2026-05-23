@@ -319,6 +319,7 @@ def main():
 
     print(f"Loading {args.dataset} ...")
     data, target_type = LOADERS[args.dataset](args.root)
+    data = _add_degree_features(data)  # fill missing x for node types without features
 
     n_nodes = sum(data[nt].num_nodes for nt in data.node_types)
     n_edges = sum(data[et].edge_index.shape[1] for et in data.edge_types)
