@@ -19,8 +19,24 @@ result.info      # {'compression': 10.2, 'n_nodes_orig': 1000000, ...}
 
 ### Requirements
 
+**Core library**
+
 ```bash
-pip install torch torch-geometric pybind11 scikit-learn
+pip install torch torch-geometric numpy scikit-learn pybind11
+```
+
+**Benchmark datasets** (`benchmark.py` only — install what you need)
+
+| Dataset | Extra package | Install |
+|---------|--------------|---------|
+| AMiner  | `pandas`     | `pip install pandas` |
+| ogbn-mag | `ogb`       | `pip install ogb` |
+| ACM (fallback) | `scipy` | `pip install scipy` |
+
+Or install everything at once:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ### Option 1 — Compile the C++ kernel (recommended)
@@ -47,7 +63,7 @@ hcgc.compress(
     ratio        = 0.1,     # fraction of nodes to keep  (0.1 = 10x compression)
     target_type  = None,    # classification target node type (auto-detected)
     pretrain     = True,    # GNN pretrain → better embedding quality
-    pretrain_epochs = 30,   # pretrain epochs (ignored for large graphs)
+    pretrain_epochs = 100,  # max pretrain epochs; early stopping applies
     device       = 'auto',  # 'auto' | 'cpu' | 'cuda'
     verbose      = True,
 ) -> HCGCResult

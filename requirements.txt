@@ -1,0 +1,11 @@
+# ── Core library ─────────────────────────────────────────────────────────────
+torch>=2.0
+torch-geometric>=2.0
+numpy
+scikit-learn
+pybind11          # C++ kernel build tool
+
+# ── Benchmark datasets (benchmark.py only) ───────────────────────────────────
+pandas            # torch_geometric.datasets.AMiner
+scipy             # ACM fallback loader (optional, HGBDataset preferred)
+ogb               # ogbn-mag  (pip install ogb)
