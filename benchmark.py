@@ -141,9 +141,9 @@ class _HeteroSAGE(torch.nn.Module):
         return self.clf(h[target_type])
 
 
-def train_downstream(result, target_type, device_str,
-                     epochs=200, lr=1e-3, patience=30, hidden=256):
-    """Train a 2-layer HeteroSAGE on the compressed graph.
+def train_on_heterodata(data, target_type, device_str,
+                        epochs=200, lr=1e-3, patience=30, hidden=256):
+    """Train a 2-layer HeteroSAGE on any HeteroData object.
 
     Returns
     -------
@@ -153,7 +153,7 @@ def train_downstream(result, target_type, device_str,
     dev = torch.device(
         ('cuda' if torch.cuda.is_available() else 'cpu')
         if device_str == 'auto' else device_str)
-    cdata = result.data.to(dev)
+    cdata = data.to(dev)
 
     feat_dims = {
         nt: cdata[nt].x.shape[1]
@@ -203,9 +203,23 @@ def train_downstream(result, target_type, device_str,
     return best_test, time.perf_counter() - t0
 
 
+def train_downstream(result, target_type, device_str,
+                     epochs=200, lr=1e-3, patience=30, hidden=256):
+    """Thin wrapper: train on a compressed HCGCResult."""
+    return train_on_heterodata(result.data, target_type, device_str,
+                               epochs=epochs, lr=lr, patience=patience,
+                               hidden=hidden)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Single benchmark run
 # ══════════════════════════════════════════════════════════════════════════════
+
+def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256):
+    """Train on the original (uncompressed) graph. Returns (test_acc, elapsed)."""
+    return train_on_heterodata(data, target_type, device,
+                               epochs=train_epochs, hidden=train_hidden)
+
 
 def run_once(data, target_type, ratio, device, pretrain,
              train_epochs=200, train_hidden=256, verbose=False):
@@ -287,6 +301,8 @@ def main():
                         help='Downstream training epochs per run')
     parser.add_argument('--train-hidden', type=int, default=256,
                         help='Hidden dim for downstream GNN')
+    parser.add_argument('--baseline', action='store_true',
+                        help='Also train on the original graph and print speedup comparison')
     args = parser.parse_args()
 
     pretrain = not args.no_pretrain
@@ -312,6 +328,18 @@ def main():
     print(f"  edge types : {len(data.edge_types)}")
     print(f"  total nodes: {n_nodes:,}   total edges: {n_edges:,}")
     print(f"  target type: {target_type!r}")
+
+    # ── Baseline (original graph training) ───────────────────────────────────
+    base_records = []
+    if args.baseline:
+        print(f"\nBaseline: training on original graph ({args.runs} runs) ...")
+        for i in range(args.runs):
+            print(f"  baseline run {i+1}/{args.runs} ... ", end='', flush=True)
+            acc, t = run_baseline(data, target_type, args.device,
+                                  train_epochs=args.train_epochs,
+                                  train_hidden=args.train_hidden)
+            base_records.append({'t_train': t, 'test_acc': acc})
+            print(f"t={t:.1f}s  test_acc={acc:.4f}")
 
     # ── Warmup ────────────────────────────────────────────────────────────────
     # The first call to hcgc_module (C++ via pybind11) and the first PyTorch
@@ -379,6 +407,30 @@ def main():
     print()
     acc_m, acc_s = stat('test_acc')
     print(f"  {'Test accuracy':<28}: {_fmt(acc_m, acc_s, '.4f')}")
+
+    # ── Baseline comparison ───────────────────────────────────────────────────
+    if base_records:
+        b_t_m  = float(np.mean([r['t_train']  for r in base_records]))
+        b_t_s  = float(np.std ([r['t_train']  for r in base_records]))
+        b_acc_m = float(np.mean([r['test_acc'] for r in base_records]))
+        b_acc_s = float(np.std ([r['test_acc'] for r in base_records]))
+
+        train_speedup = b_t_m / max(tt_m, 1e-6)
+        total_speedup = b_t_m / max(tot_m, 1e-6)
+        acc_drop      = b_acc_m - acc_m
+
+        print()
+        print(f"  {'─'*58}")
+        print(f"  {'Baseline vs HCGC comparison':^58}")
+        print(f"  {'─'*58}")
+        print(f"  {'':28}  {'Baseline':>10}  {'HCGC':>10}")
+        print(f"  {'Train time (comp. graph only)':<28}  {b_t_m:>9.1f}s  {tt_m:>9.1f}s"
+              f"  ({train_speedup:.1f}x faster)")
+        print(f"  {'Total time (incl. compress)':<28}  {'—':>10}  {tot_m:>9.1f}s"
+              f"  ({total_speedup:.1f}x vs baseline train)")
+        print(f"  {'Test accuracy':<28}  {b_acc_m:>10.4f}  {acc_m:>10.4f}"
+              f"  ({acc_drop:+.4f} drop)")
+
     print(f"{'='*W}\n")
 
 
