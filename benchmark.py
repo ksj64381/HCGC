@@ -177,9 +177,9 @@ def load_ogbn_mag(root):
         data['field_of_study'].num_nodes, pf, ei_pt[0], ei_pt[1])
 
     # ── Add reverse edges for bidirectional message passing ───────────────────
-    data[('paper',         'rev_writes',         'author')].edge_index = ei_wp.flip(0)
-    data[('institution',   'rev_affiliated_with', 'author')].edge_index = ei_ai.flip(0)
-    data[('field_of_study','rev_has_topic',       'paper')].edge_index  = ei_pt.flip(0)
+    data[('paper',         'rev_writes',         'author')].edge_index = ei_wp.flip(0).contiguous()
+    data[('institution',   'rev_affiliated_with', 'author')].edge_index = ei_ai.flip(0).contiguous()
+    data[('field_of_study','rev_has_topic',       'paper')].edge_index  = ei_pt.flip(0).contiguous()
 
     # ── Paper labels and split masks ──────────────────────────────────────────
     if data['paper'].y.dim() == 2:

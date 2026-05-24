@@ -207,7 +207,7 @@ def build_compressed_data(data, coalition_map, offsets, type_boundaries,
         ei    = data[et].edge_index
         new_s = local_cm[s_type][ei[0]]
         new_d = local_cm[d_type][ei[1]]
-        comp_ei = torch.unique(torch.stack([new_s, new_d]), dim=1)
+        comp_ei = torch.unique(torch.stack([new_s, new_d]), dim=1).contiguous()
         cdata[et].edge_index = comp_ei
 
         n_orig = ei.shape[1]
