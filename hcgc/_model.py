@@ -11,6 +11,12 @@ import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import HeteroConv, SAGEConv
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    def _tqdm(it, **kw):
+        return it
+
 import hcgc._config as _cfg
 from hcgc._config import _CFG, set_seed
 
@@ -222,7 +228,9 @@ def train_full_batch(model, hdata, epochs, lr, desc='',
     best_state = None
 
     t0 = time.time()
-    for ep in range(1, epochs + 1):
+    ep_bar = _tqdm(range(1, epochs + 1), desc=f'  [{desc}]', unit='ep',
+                   ncols=88, leave=True)
+    for ep in ep_bar:
         model.train(); opt.zero_grad()
         out = model(xd, eid)
         if soft_y is not None:
@@ -252,11 +260,17 @@ def train_full_batch(model, hdata, epochs, lr, desc='',
                     no_imp += eval_every
                 val_str = f'{va_acc:.4f}'
                 best_val_str = f'{best["val"]:.4f}'
-            print(f"  [{desc}] ep {ep:3d}/{epochs} | loss={loss.item():.4f} "
-                  f"| val={val_str} | test={te_acc:.4f}  "
-                  f"(best val={best_val_str} @ ep {best['epoch']})")
+            ep_bar.set_postfix(
+                loss=f'{loss.item():.4f}',
+                val=val_str,
+                best=best_val_str,
+                pat=no_imp,
+            )
             if not val_is_nan and no_imp >= patience:
-                print(f"  [{desc}] Early stop at ep {ep}."); break
+                ep_bar.set_description(f'  [{desc}][early-stop]')
+                break
+        else:
+            ep_bar.set_postfix(loss=f'{loss.item():.4f}', best=f'{best["val"]:.4f}')
 
     # Restore best-val weights
     if best_state is not None:
@@ -308,7 +322,9 @@ def train_mini_batch(model, data, epochs, lr,
     best_state = None
 
     t0 = time.time()
-    for ep in range(1, epochs + 1):
+    ep_bar = _tqdm(range(1, epochs + 1), desc=f'  [{desc}]', unit='ep',
+                   ncols=88, leave=True)
+    for ep in ep_bar:
         model.train()
         ep_loss = 0.0; n_batches = 0
         for batch in train_loader:
@@ -330,6 +346,7 @@ def train_mini_batch(model, data, epochs, lr,
             opt.step()
             ep_loss += loss.item(); n_batches += 1
         sched.step()
+        avg_loss = ep_loss / max(n_batches, 1)
 
         if ep % eval_every == 0 or ep == epochs:
             va_acc, te_acc = _eval_mini_batch(model, data, batch_size, num_neighbors)
@@ -348,12 +365,17 @@ def train_mini_batch(model, data, epochs, lr,
                     no_imp += eval_every
                 val_str      = f'{va_acc:.4f}'
                 best_val_str = f'{best["val"]:.4f}'
-            avg_loss = ep_loss / max(n_batches, 1)
-            print(f"  [{desc}] ep {ep:3d}/{epochs} | loss={avg_loss:.4f} "
-                  f"| val={val_str} | test={te_acc:.4f}  "
-                  f"(best val={best_val_str} @ ep {best['epoch']})")
+            ep_bar.set_postfix(
+                loss=f'{avg_loss:.4f}',
+                val=val_str,
+                best=best_val_str,
+                pat=no_imp,
+            )
             if not val_is_nan and no_imp >= patience:
-                print(f"  [{desc}] Early stop at ep {ep}."); break
+                ep_bar.set_description(f'  [{desc}][early-stop]')
+                break
+        else:
+            ep_bar.set_postfix(loss=f'{avg_loss:.4f}', best=f'{best["val"]:.4f}')
 
     # Restore best-val weights
     if best_state is not None:
