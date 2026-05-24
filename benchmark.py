@@ -29,6 +29,13 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, SAGEConv
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    # Graceful fallback: plain iterable with no bar
+    def _tqdm(it, **kw):
+        return it
+
 import hcgc
 
 
@@ -719,8 +726,13 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     patience_steps      = max(patience // eval_every, 1)
     t0 = time.perf_counter()
 
-    for ep in range(1, epochs + 1):
+    ep_bar = _tqdm(range(1, epochs + 1), desc='  train', unit='ep',
+                   ncols=88, leave=True)
+    last_loss = float('nan')
+    for ep in ep_bar:
         model.train()
+        total_loss = 0.0
+        n_batches  = 0
         for batch in train_loader:
             batch = batch.to(dev)
             out   = model(batch.x_dict, batch.edge_index_dict, target_type)
@@ -729,6 +741,9 @@ def _train_mini_batch_downstream(data, target_type, device_str,
             opt.zero_grad()
             loss.backward()
             opt.step()
+            total_loss += loss.item()
+            n_batches  += 1
+        last_loss = total_loss / max(n_batches, 1)
 
         if ep % eval_every == 0:
             model.eval()
@@ -741,8 +756,18 @@ def _train_mini_batch_downstream(data, target_type, device_str,
             else:
                 no_improve += 1
 
+            ep_bar.set_postfix(
+                loss=f'{last_loss:.4f}',
+                val=f'{val_acc:.4f}',
+                best=f'{best_val:.4f}',
+                pat=f'{no_improve}/{patience_steps}',
+            )
+
             if no_improve >= patience_steps:
+                ep_bar.set_description('  train [early-stop]')
                 break
+        else:
+            ep_bar.set_postfix(loss=f'{last_loss:.4f}', best=f'{best_val:.4f}')
 
     elapsed = time.perf_counter() - t0
 
@@ -825,10 +850,13 @@ def train_on_heterodata(data, target_type, device_str,
     best_state          = None
     no_improve          = 0          # measured in eval steps, not epochs
     eval_every          = 10
+    patience_steps      = max(patience // eval_every, 1)
 
     t0 = time.perf_counter()
 
-    for ep in range(1, epochs + 1):
+    ep_bar = _tqdm(range(1, epochs + 1), desc='  train', unit='ep',
+                   ncols=88, leave=True)
+    for ep in ep_bar:
         model.train()
         opt.zero_grad()
         out  = model(cdata.x_dict, cdata.edge_index_dict, target_type)
@@ -855,8 +883,18 @@ def train_on_heterodata(data, target_type, device_str,
             else:
                 no_improve += 1
 
-            if no_improve >= patience // eval_every:
+            ep_bar.set_postfix(
+                loss=f'{loss.item():.4f}',
+                val=f'{val_acc:.4f}',
+                best=f'{best_val:.4f}',
+                pat=f'{no_improve}/{patience_steps}',
+            )
+
+            if no_improve >= patience_steps:
+                ep_bar.set_description('  train [early-stop]')
                 break
+        else:
+            ep_bar.set_postfix(loss=f'{loss.item():.4f}', best=f'{best_val:.4f}')
 
     elapsed = time.perf_counter() - t0
 
