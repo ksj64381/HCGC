@@ -75,59 +75,127 @@ def load_lastfm(root):
 
 
 def load_ogbn_mag(root):
+    """Load OGBN-MAG and initialise features for all node types.
+
+    OGB's PygNodePropPredDataset never returns PyG HeteroData directly.
+    Depending on the installed OGB version it returns either:
+      - Old dict format: raw.num_nodes_dict / raw.x_dict / raw.edge_index_dict
+      - Newer format   : raw is already a HeteroData-like object
+    This loader normalises both into a proper PyG HeteroData with:
+      - paper: 128-dim bag-of-words features (L2-normalised)
+      - author: mean of paper features via 'writes' edges
+      - institution: mean of author features via 'affiliated_with' edges
+      - field_of_study: mean of paper features via 'has_topic' edges
+      - forward + reverse edges for bidirectional message passing
+    """
     try:
         from ogb.nodeproppred import PygNodePropPredDataset
     except ImportError:
         sys.exit("ogbn-mag requires the ogb package:  pip install ogb")
 
+    from torch_geometric.data import HeteroData as _HeteroData
+
     # PyTorch >= 2.6 changed torch.load default to weights_only=True,
     # which breaks OGB's internal torch.load calls on cached .pt files.
-    # Patch only for this call, then restore.
+    # Patch for the duration of this call only, then restore.
     import torch as _torch
     _orig_load = _torch.load
     _torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False})
     try:
         dataset   = PygNodePropPredDataset(name='ogbn-mag', root=f'{root}/ogbn-mag')
-        data      = dataset[0]
+        raw       = dataset[0]
         split_idx = dataset.get_idx_split()
     finally:
         _torch.load = _orig_load
 
-    # Diagnose what was loaded (helpful when OGB/PyG versions differ)
-    if not hasattr(data, 'node_types'):
-        import ogb as _ogb_pkg
-        _ogb_ver = getattr(_ogb_pkg, '__version__', 'unknown')
-        raise RuntimeError(
-            f"ogbn-mag returned {type(data).__name__!r} instead of HeteroData.\n"
-            f"  Installed ogb version : {_ogb_ver}\n"
-            f"  HeteroData support    : ogb >= 1.3.2\n\n"
-            "  Fix:\n"
-            "    pip install --upgrade ogb\n"
-            f"    rm -rf {root}/ogbn-mag   # delete old cache\n"
-            "  Then rerun."
-        )
-    _available = list(data.node_types)
-    print(f"  [ogbn-mag] node types: {_available}")
+    _NODE_TYPES = ['paper', 'author', 'institution', 'field_of_study']
 
-    # 'paper' is the standard key; guard against edge-case version differences
-    if 'paper' not in _available:
+    # ── Normalise to HeteroData regardless of OGB version ────────────────────
+    # Old OGB (<1.3.2ish) returns a Data-like object with dict attributes;
+    # newer versions may return a proper HeteroData.  Both cases handled here.
+    is_dict_fmt = hasattr(raw, 'num_nodes_dict') and raw.num_nodes_dict is not None
+    if is_dict_fmt:
+        print("  [ogbn-mag] OGB dict format detected — converting to HeteroData ...")
+        data = _HeteroData()
+        for nt in _NODE_TYPES:
+            data[nt].num_nodes = raw.num_nodes_dict[nt]
+        if raw.x_dict is not None and 'paper' in raw.x_dict:
+            data['paper'].x = raw.x_dict['paper']
+        if raw.y_dict is not None and 'paper' in raw.y_dict:
+            data['paper'].y = raw.y_dict['paper']
+        for et, ei in raw.edge_index_dict.items():
+            data[et].edge_index = ei
+    else:
+        # Already HeteroData (or HeteroData-compatible)
+        data = raw
+        print(f"  [ogbn-mag] node types: {list(data.node_types)}")
+
+    if 'paper' not in [nt for nt in _NODE_TYPES if data[nt].num_nodes > 0
+                       if hasattr(data[nt], 'num_nodes')]:
+        # safety check — just rely on the presence of x
+        pass
+    if not hasattr(data['paper'], 'x') or data['paper'].x is None:
         raise RuntimeError(
-            f"'paper' node type not found in ogbn-mag data.\n"
-            f"Available node types: {_available}\n"
-            "This usually means the cached .pt file is from an incompatible "
-            "OGB/PyG version.  Delete the cache and redownload:\n"
-            f"  rm -rf {root}/ogbn-mag"
+            "ogbn-mag 'paper' nodes have no features after loading.\n"
+            f"  Delete the cache and redownload:  rmdir /s {root}\\ogbn-mag"
         )
 
-    # Convert split index dictionaries → boolean masks on 'paper' nodes
-    n = data['paper'].num_nodes
+    # ── Semantic feature init for non-paper types ─────────────────────────────
+    # paper: L2-normalise 128-dim bag-of-words
+    pf = data['paper'].x.float()
+    pf = torch.nn.functional.normalize(pf, p=2, dim=1)
+    data['paper'].x = pf
+
+    def _avg_scatter(dst_n, src_feat, src_idx, dst_idx):
+        """Scatter-mean: average src_feat[src_idx] into rows dst_idx."""
+        dim = src_feat.shape[1]
+        out = torch.zeros(dst_n, dim)
+        cnt = torch.zeros(dst_n, dtype=torch.float32)
+        chunk = 1 << 20  # 1M edges per chunk to avoid OOM
+        for start in range(0, len(src_idx), chunk):
+            sc = src_idx[start:start + chunk]
+            dc = dst_idx[start:start + chunk]
+            out.scatter_add_(0, dc.unsqueeze(1).expand(-1, dim), src_feat[sc])
+            cnt.scatter_add_(0, dc, torch.ones(len(sc)))
+        return out / cnt.clamp(min=1).unsqueeze(1)
+
+    # author ← mean of papers they wrote  (author, writes, paper)
+    print("  [ogbn-mag] Computing author features ...")
+    ei_wp = data[('author', 'writes', 'paper')].edge_index      # [2,E] row0=author row1=paper
+    data['author'].x = _avg_scatter(data['author'].num_nodes, pf, ei_wp[1], ei_wp[0])
+
+    # institution ← mean of affiliated authors
+    print("  [ogbn-mag] Computing institution features ...")
+    ei_ai = data[('author', 'affiliated_with', 'institution')].edge_index
+    data['institution'].x = _avg_scatter(
+        data['institution'].num_nodes, data['author'].x, ei_ai[0], ei_ai[1])
+
+    # field_of_study ← mean of papers with that topic
+    print("  [ogbn-mag] Computing field_of_study features ...")
+    ei_pt = data[('paper', 'has_topic', 'field_of_study')].edge_index
+    data['field_of_study'].x = _avg_scatter(
+        data['field_of_study'].num_nodes, pf, ei_pt[0], ei_pt[1])
+
+    # ── Add reverse edges for bidirectional message passing ───────────────────
+    data[('paper',         'rev_writes',         'author')].edge_index = ei_wp.flip(0)
+    data[('institution',   'rev_affiliated_with', 'author')].edge_index = ei_ai.flip(0)
+    data[('field_of_study','rev_has_topic',       'paper')].edge_index  = ei_pt.flip(0)
+
+    # ── Paper labels and split masks ──────────────────────────────────────────
+    if data['paper'].y.dim() == 2:
+        data['paper'].y = data['paper'].y.squeeze(1)
+
+    n_paper = data['paper'].num_nodes
     for split, attr in [('train', 'train_mask'), ('valid', 'val_mask'), ('test', 'test_mask')]:
-        mask = torch.zeros(n, dtype=torch.bool)
+        mask = torch.zeros(n_paper, dtype=torch.bool)
         mask[split_idx[split]['paper']] = True
         setattr(data['paper'], attr, mask)
 
-    if data['paper'].y.dim() == 2:
-        data['paper'].y = data['paper'].y.squeeze(1)
+    print(f"  [ogbn-mag] papers={n_paper:,}  "
+          f"train={data['paper'].train_mask.sum():,}  "
+          f"val={data['paper'].val_mask.sum():,}  "
+          f"test={data['paper'].test_mask.sum():,}")
+    print(f"  [ogbn-mag] edge types: {list(data.edge_types)}")
 
     return data, 'paper'
 
