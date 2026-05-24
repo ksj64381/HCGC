@@ -683,7 +683,11 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                                     hidden, num_classes, dev=dev)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
-    num_neighbors = [10, 10]   # 2 hops, 10 neighbours per edge type per hop
+    # Per-edge-type neighbor counts: [hop1, hop2].
+    # Using a dict avoids the "list × n_edge_types" explosion on dense hetero
+    # graphs like ogbn-mag (7 edge types × [10,10] = 70 neighbours/hop → huge
+    # subgraphs).  [10, 5] matches the reference benchmark_ogbn_mag.py.
+    num_neighbors = {et: [10, 5] for et in data.edge_types}
 
     train_loader = NeighborLoader(
         data,
@@ -691,6 +695,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         batch_size    = batch_size,
         input_nodes   = (target_type, data[target_type].train_mask),
         shuffle       = True,
+        num_workers   = 0,
     )
     val_loader = NeighborLoader(
         data,
@@ -698,6 +703,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         batch_size    = batch_size * 4,
         input_nodes   = (target_type, data[target_type].val_mask),
         shuffle       = False,
+        num_workers   = 0,
     )
     test_loader = NeighborLoader(
         data,
@@ -705,6 +711,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         batch_size    = batch_size * 4,
         input_nodes   = (target_type, data[target_type].test_mask),
         shuffle       = False,
+        num_workers   = 0,
     )
 
     def _eval(loader):
