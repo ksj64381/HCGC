@@ -95,9 +95,16 @@ def load_ogbn_mag(root):
 
     # Diagnose what was loaded (helpful when OGB/PyG versions differ)
     if not hasattr(data, 'node_types'):
+        import ogb as _ogb_pkg
+        _ogb_ver = getattr(_ogb_pkg, '__version__', 'unknown')
         raise RuntimeError(
-            f"ogbn-mag returned unexpected type {type(data).__name__!r} — "
-            "expected HeteroData.  Try: pip install --upgrade ogb torch-geometric"
+            f"ogbn-mag returned {type(data).__name__!r} instead of HeteroData.\n"
+            f"  Installed ogb version : {_ogb_ver}\n"
+            f"  HeteroData support    : ogb >= 1.3.2\n\n"
+            "  Fix:\n"
+            "    pip install --upgrade ogb\n"
+            f"    rm -rf {root}/ogbn-mag   # delete old cache\n"
+            "  Then rerun."
         )
     _available = list(data.node_types)
     print(f"  [ogbn-mag] node types: {_available}")
