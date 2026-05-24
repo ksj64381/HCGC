@@ -93,6 +93,25 @@ def load_ogbn_mag(root):
     finally:
         _torch.load = _orig_load
 
+    # Diagnose what was loaded (helpful when OGB/PyG versions differ)
+    if not hasattr(data, 'node_types'):
+        raise RuntimeError(
+            f"ogbn-mag returned unexpected type {type(data).__name__!r} — "
+            "expected HeteroData.  Try: pip install --upgrade ogb torch-geometric"
+        )
+    _available = list(data.node_types)
+    print(f"  [ogbn-mag] node types: {_available}")
+
+    # 'paper' is the standard key; guard against edge-case version differences
+    if 'paper' not in _available:
+        raise RuntimeError(
+            f"'paper' node type not found in ogbn-mag data.\n"
+            f"Available node types: {_available}\n"
+            "This usually means the cached .pt file is from an incompatible "
+            "OGB/PyG version.  Delete the cache and redownload:\n"
+            f"  rm -rf {root}/ogbn-mag"
+        )
+
     # Convert split index dictionaries → boolean masks on 'paper' nodes
     n = data['paper'].num_nodes
     for split, attr in [('train', 'train_mask'), ('valid', 'val_mask'), ('test', 'test_mask')]:
