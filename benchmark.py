@@ -683,11 +683,17 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                                     hidden, num_classes, dev=dev)
     opt   = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Per-edge-type neighbor counts: [hop1, hop2].
-    # Using a dict avoids the "list × n_edge_types" explosion on dense hetero
-    # graphs like ogbn-mag (7 edge types × [10,10] = 70 neighbours/hop → huge
-    # subgraphs).  [10, 5] matches the reference benchmark_ogbn_mag.py.
-    num_neighbors = {et: [10, 5] for et in data.edge_types}
+    # Per-edge-type neighbor counts: {et: [hop1, hop2]}.
+    # Dense hetero graphs (e.g. ogbn-mag 7 edge types) blow up quickly with
+    # large fan-outs; [5, 3] keeps subgraphs manageable while still capturing
+    # 2-hop context.  Eval loaders use slightly larger batches but same counts.
+    num_neighbors = {et: [5, 3] for et in data.edge_types}
+
+    # Detect number of usable CPU workers for parallel subgraph sampling.
+    # num_workers > 0 overlaps CPU sampling with GPU compute; use 4 on Linux
+    # (fork-safe), 0 on Windows (spawn overhead makes it slower).
+    import os as _os
+    _n_workers = 4 if _os.name == 'posix' else 0
 
     train_loader = NeighborLoader(
         data,
@@ -695,7 +701,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         batch_size    = batch_size,
         input_nodes   = (target_type, data[target_type].train_mask),
         shuffle       = True,
-        num_workers   = 0,
+        num_workers   = _n_workers,
     )
     val_loader = NeighborLoader(
         data,
@@ -703,7 +709,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         batch_size    = batch_size * 4,
         input_nodes   = (target_type, data[target_type].val_mask),
         shuffle       = False,
-        num_workers   = 0,
+        num_workers   = _n_workers,
     )
     test_loader = NeighborLoader(
         data,
@@ -711,7 +717,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         batch_size    = batch_size * 4,
         input_nodes   = (target_type, data[target_type].test_mask),
         shuffle       = False,
-        num_workers   = 0,
+        num_workers   = _n_workers,
     )
 
     def _eval(loader):
