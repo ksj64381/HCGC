@@ -80,9 +80,18 @@ def load_ogbn_mag(root):
     except ImportError:
         sys.exit("ogbn-mag requires the ogb package:  pip install ogb")
 
-    dataset   = PygNodePropPredDataset(name='ogbn-mag', root=f'{root}/ogbn-mag')
-    data      = dataset[0]
-    split_idx = dataset.get_idx_split()
+    # PyTorch >= 2.6 changed torch.load default to weights_only=True,
+    # which breaks OGB's internal torch.load calls on cached .pt files.
+    # Patch only for this call, then restore.
+    import torch as _torch
+    _orig_load = _torch.load
+    _torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, 'weights_only': False})
+    try:
+        dataset   = PygNodePropPredDataset(name='ogbn-mag', root=f'{root}/ogbn-mag')
+        data      = dataset[0]
+        split_idx = dataset.get_idx_split()
+    finally:
+        _torch.load = _orig_load
 
     # Convert split index dictionaries → boolean masks on 'paper' nodes
     n = data['paper'].num_nodes
