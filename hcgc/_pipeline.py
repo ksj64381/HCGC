@@ -179,14 +179,16 @@ def _load_and_pretrain(data, args):
                         epochs=args.pretrain_epochs, lr=args.lr,
                         args=args, desc='pretrain')
             args.patience = _orig_patience
+            t0_emb = time.time()
             print(f"  [Emb] Extracting embeddings ...")
             emb_dict = _extract_emb_auto(pretrain_model, data, args)
+            print(f"  [Emb] Extraction done in {time.time()-t0_emb:.1f}s")
             del pretrain_model
             if _cfg.DEVICE.type == 'cuda':
                 torch.cuda.empty_cache()
 
         t_pretrain = time.time() - t0_pre
-        print(f"  [Embed] Done in {t_pretrain:.1f}s")
+        print(f"  [Pretrain+Emb] Total: {t_pretrain:.1f}s")
         coarsen_features, coarsen_feat_dims = extract_emb_flat_arrays(emb_dict)
 
     return dict(

@@ -983,11 +983,12 @@ def run_once(data, target_type, ratio, device, pretrain,
         warnings.simplefilter('ignore')
         result = hcgc.compress(
             data,
-            ratio       = ratio,
-            target_type = target_type,
-            pretrain    = pretrain,
-            device      = device,
-            verbose     = verbose,
+            ratio           = ratio,
+            target_type     = target_type,
+            pretrain        = pretrain,
+            device          = device,
+            verbose         = verbose,
+            mini_batch_size = mini_batch_size,
         )
     t_compress = time.perf_counter() - t0
 

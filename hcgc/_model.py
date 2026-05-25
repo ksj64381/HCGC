@@ -446,6 +446,9 @@ def _extract_emb_mini_batch(model, data, batch_size=512, num_neighbors=None):
     emb_acc  = {nt: torch.zeros(n, emb_dim) for nt, n in node_counts.items()}
     emb_cnt  = {nt: torch.zeros(n, dtype=torch.long) for nt, n in node_counts.items()}
 
+    import os as _os
+    _n_workers = 4 if _os.name == 'posix' else 0
+
     for seed_nt in _CFG.node_types:
         n_seed = data[seed_nt].num_nodes
         seed_mask = torch.ones(n_seed, dtype=torch.bool)
@@ -455,7 +458,7 @@ def _extract_emb_mini_batch(model, data, batch_size=512, num_neighbors=None):
             batch_size=batch_size,
             input_nodes=(seed_nt, seed_mask),
             shuffle=False,
-            num_workers=0,
+            num_workers=_n_workers,
         )
         model.eval()
         with torch.no_grad():
