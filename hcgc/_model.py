@@ -236,7 +236,7 @@ def train_full_batch(model, hdata, epochs, lr, desc='',
         if soft_y is not None:
             loss = -(soft_y[tr] * F.log_softmax(out[tr], dim=1)).sum(1).mean()
         else:
-            loss = F.cross_entropy(out[tr], y[tr])
+            loss = F.cross_entropy(out[tr], y[tr], ignore_index=-1)
         loss.backward(); opt.step(); sched.step()
 
         if ep % eval_every == 0 or ep == epochs:
@@ -346,7 +346,8 @@ def train_mini_batch(model, data, epochs, lr,
                 b_soft  = soft_y[b_nids][b_mask.cpu()].to(_cfg.DEVICE)
                 loss = -(b_soft * F.log_softmax(out[:bs][b_mask], dim=1)).sum(1).mean()
             else:
-                loss = F.cross_entropy(out[:bs][b_mask], b_y[b_mask])
+                loss = F.cross_entropy(out[:bs][b_mask], b_y[b_mask],
+                                       ignore_index=-1)
             loss.backward()
             opt.step()
             ep_loss += loss.item(); n_batches += 1
@@ -454,9 +455,10 @@ def _extract_emb_mini_batch(model, data, batch_size=512, num_neighbors=None):
     emb_acc  = {nt: torch.zeros(n, emb_dim) for nt, n in node_counts.items()}
     emb_cnt  = {nt: torch.zeros(n, dtype=torch.long) for nt, n in node_counts.items()}
 
-    import os as _os
-    _n_workers = 4 if _os.name == 'posix' else 0
-
+    # Embedding extraction is inference-only: num_workers=0 avoids the
+    # "Too many open files" crash that occurs when iterating over many node
+    # types in a loop (each NeighborLoader with workers>0 opens shared-memory
+    # handles; with 8 node types × 36 edge types the fd limit is hit quickly).
     for seed_nt in _CFG.node_types:
         n_seed = data[seed_nt].num_nodes
         seed_mask = torch.ones(n_seed, dtype=torch.bool)
@@ -466,7 +468,7 @@ def _extract_emb_mini_batch(model, data, batch_size=512, num_neighbors=None):
             batch_size=batch_size,
             input_nodes=(seed_nt, seed_mask),
             shuffle=False,
-            num_workers=_n_workers,
+            num_workers=0,
         )
         model.eval()
         with torch.no_grad():

@@ -172,15 +172,31 @@ def build_compressed_data(data, coalition_map, offsets, type_boundaries,
         )
     vote = torch.zeros(ns_a, _CFG.num_classes, dtype=torch.long)
     vote.scatter_add_(0, lc_a.unsqueeze(1).expand(-1, _CFG.num_classes), one_hot)
-    cdata[nt].y = vote.argmax(dim=1)
+
+    # has_any_label[i] = True if supernode i contains ≥1 labeled original node.
+    # Supernodes with no labeled nodes get y=-1 (ignored in loss) instead of
+    # argmax=0 (spurious class-0 label) — important for semi-supervised datasets
+    # like Freebase where most nodes are unlabeled.
+    has_any_label = vote.sum(dim=1) > 0
+    y_super = vote.argmax(dim=1)
+    y_super[~has_any_label] = -1          # -1 = unlabeled / ignored
+    cdata[nt].y = y_super
 
     if use_soft_labels:
         vf = vote.float()
         cdata[nt].soft_y = vf / vf.sum(dim=1, keepdim=True).clamp(min=1)
 
-    purity = vote.max(dim=1).values.float() / vote.sum(dim=1).float().clamp(min=1)
-    print(f"  [comp] {nt} supernode purity: {purity.mean():.4f} "
-          f"(min {purity.min():.3f}, median {purity.median():.3f})")
+    # Purity: only count supernodes that actually have labeled nodes
+    labeled_super = has_any_label
+    if labeled_super.any():
+        purity = (vote.max(dim=1).values.float()
+                  / vote.sum(dim=1).float().clamp(min=1))
+        p_lab = purity[labeled_super]
+        print(f"  [comp] {nt} supernode purity (labeled only): {p_lab.mean():.4f} "
+              f"(min {p_lab.min():.3f}, median {p_lab.median():.3f})"
+              f"  [{labeled_super.sum():,}/{ns_a:,} supernodes have labels]")
+    else:
+        print(f"  [comp] {nt} supernode purity: N/A (no labeled supernodes)")
 
     n_tr = torch.zeros(ns_a, dtype=torch.long)
     n_va = torch.zeros(ns_a, dtype=torch.long)

@@ -929,8 +929,10 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                 out   = model(batch.x_dict, batch.edge_index_dict, target_type)
                 n     = batch[target_type].batch_size
                 pred  = out[:n].argmax(dim=1)
-                correct += (pred == batch[target_type].y[:n]).sum().item()
-                total   += n
+                lbl   = batch[target_type].y[:n]
+                valid = lbl >= 0          # exclude y=-1 (unlabeled supernodes)
+                correct += (pred[valid] == lbl[valid]).sum().item()
+                total   += valid.sum().item()
         return correct / max(total, 1)
 
     best_val, best_test = 0.0, 0.0
@@ -968,7 +970,8 @@ def _train_mini_batch_downstream(data, target_type, device_str,
             batch = batch.to(dev)
             out   = model(batch.x_dict, batch.edge_index_dict, target_type)
             n     = batch[target_type].batch_size
-            loss  = F.cross_entropy(out[:n], batch[target_type].y[:n])
+            loss  = F.cross_entropy(out[:n], batch[target_type].y[:n],
+                                    ignore_index=-1)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -1118,7 +1121,8 @@ def train_on_heterodata(data, target_type, device_str,
         opt.zero_grad()
         out  = model(cdata.x_dict, cdata.edge_index_dict, target_type)
         mask = cdata[target_type].train_mask
-        loss = F.cross_entropy(out[mask], cdata[target_type].y[mask])
+        loss = F.cross_entropy(out[mask], cdata[target_type].y[mask],
+                               ignore_index=-1)
         loss.backward()
         opt.step()
 
@@ -1129,10 +1133,13 @@ def train_on_heterodata(data, target_type, device_str,
             pred = out.argmax(dim=1)
             y    = cdata[target_type].y
 
-            val_acc  = (pred[cdata[target_type].val_mask]
-                        == y[cdata[target_type].val_mask]).float().mean().item()
-            test_acc = (pred[cdata[target_type].test_mask]
-                        == y[cdata[target_type].test_mask]).float().mean().item()
+            def _masked_acc(mask):
+                idx = mask & (y >= 0)   # exclude y=-1 unlabeled supernodes
+                if idx.sum() == 0:
+                    return 0.0
+                return (pred[idx] == y[idx]).float().mean().item()
+            val_acc  = _masked_acc(cdata[target_type].val_mask)
+            test_acc = _masked_acc(cdata[target_type].test_mask)
 
             if val_acc > best_val:
                 best_val, best_test, no_improve = val_acc, test_acc, 0
