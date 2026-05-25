@@ -302,9 +302,12 @@ def train_mini_batch(model, data, epochs, lr,
     if num_neighbors is None:
         num_neighbors = _default_num_neighbors(data)
 
-    import os as _os
-    _n_workers = 4 if _os.name == 'posix' else 0
-
+    # num_workers=0: avoids "Too many open files" in container environments
+    # with low fd limits (EMFILE).  The pipeline creates multiple NeighborLoaders
+    # in sequence (train → eval → embedding); each worker process opens shared-
+    # memory handles and they accumulate until GC cleans them up.  Synchronous
+    # loading (num_workers=0) is safe and fast enough for the typical batch sizes
+    # used here (512–4096 seeds).
     train_mask = data[tt].train_mask
     train_loader = NeighborLoader(
         data,
@@ -312,7 +315,7 @@ def train_mini_batch(model, data, epochs, lr,
         batch_size=batch_size,
         input_nodes=(tt, train_mask),
         shuffle=True,
-        num_workers=_n_workers,
+        num_workers=0,
     )
 
     soft_y = None
@@ -400,9 +403,6 @@ def _eval_mini_batch(model, data, batch_size=512, num_neighbors=None):
     if num_neighbors is None:
         num_neighbors = _default_num_neighbors(data)
 
-    import os as _os
-    _n_workers = 4 if _os.name == 'posix' else 0
-
     n_nodes = data[tt].num_nodes
     all_nodes_mask = torch.ones(n_nodes, dtype=torch.bool)
     inf_loader = NeighborLoader(
@@ -411,7 +411,7 @@ def _eval_mini_batch(model, data, batch_size=512, num_neighbors=None):
         batch_size=batch_size,
         input_nodes=(tt, all_nodes_mask),
         shuffle=False,
-        num_workers=_n_workers,
+        num_workers=0,  # keep fd count low (see train loader comment above)
     )
 
     model.eval()

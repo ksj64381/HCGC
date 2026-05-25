@@ -882,11 +882,11 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     # 2-hop context.  Eval loaders use slightly larger batches but same counts.
     num_neighbors = {et: [5, 3] for et in data.edge_types}
 
-    # Detect number of usable CPU workers for parallel subgraph sampling.
-    # num_workers > 0 overlaps CPU sampling with GPU compute; use 4 on Linux
-    # (fork-safe), 0 on Windows (spawn overhead makes it slower).
-    import os as _os
-    _n_workers = 4 if _os.name == 'posix' else 0
+    # num_workers=0: container environments often have very low fd limits
+    # (EMFILE).  Multiple NeighborLoaders with workers>0 accumulate shared-memory
+    # handles across train/val/test loaders + inference; keeping all loaders
+    # synchronous eliminates the crash with negligible perf impact at these sizes.
+    _n_workers = 0
 
     # Re-split supernodes proportionally when the inherited val_mask is empty.
     # build_compressed_data sets  val_mask = has_val & ~has_train,  which is
@@ -1022,6 +1022,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
             batch_size      = batch_size * 4,
             input_nodes     = (target_type, torch.ones(n_target, dtype=torch.bool)),
             shuffle         = False,
+            num_workers     = 0,
         )
         preds = torch.empty(n_target, dtype=torch.long)
         model.eval()
