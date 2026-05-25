@@ -623,6 +623,46 @@ def _build_downstream_model(data, target_type, model_name, hidden, num_classes,
 _FULL_BATCH_NODE_LIMIT = 100_000
 
 
+def _resplit_supernodes(data, target_type, orig_data=None, seed=0):
+    """Re-split compressed-graph supernodes to match original train/val/test ratios.
+
+    The inherited mask logic in build_compressed_data uses
+        val_mask = has_val & ~has_train
+    which becomes nearly empty when the train ratio is high (e.g. ogbn-mag:
+    85% train → nearly every supernode contains a train node → val ≈ 0).
+    Re-splitting by proportion ensures the downstream GNN has a real validation
+    set for early stopping.  The final accuracy is always evaluated on *original*
+    test nodes via node_map, so this does not affect the benchmark metric.
+    """
+    n_super = data[target_type].num_nodes
+
+    if orig_data is not None:
+        tr_ratio = orig_data[target_type].train_mask.float().mean().item()
+        va_ratio = orig_data[target_type].val_mask.float().mean().item()
+    else:
+        tr_ratio, va_ratio = 0.6, 0.2   # fallback: 60/20/20
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    perm = torch.randperm(n_super, generator=gen)
+    n_tr = int(tr_ratio * n_super)
+    n_va = int(va_ratio * n_super)
+
+    tr_m = torch.zeros(n_super, dtype=torch.bool)
+    va_m = torch.zeros(n_super, dtype=torch.bool)
+    te_m = torch.zeros(n_super, dtype=torch.bool)
+    tr_m[perm[:n_tr]]           = True
+    va_m[perm[n_tr:n_tr + n_va]] = True
+    te_m[perm[n_tr + n_va:]]    = True
+
+    print(f"  [re-split] val_mask was empty → re-split {n_super:,} supernodes: "
+          f"train={n_tr:,} / val={n_va:,} / test={n_super-n_tr-n_va:,}")
+
+    data[target_type].train_mask = tr_m
+    data[target_type].val_mask   = va_m
+    data[target_type].test_mask  = te_m
+
+
 def _train_mini_batch_downstream(data, target_type, device_str,
                                   epochs=200, lr=1e-3, patience=30,
                                   hidden=256, batch_size=512,
@@ -695,6 +735,14 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     import os as _os
     _n_workers = 4 if _os.name == 'posix' else 0
 
+    # Re-split supernodes proportionally when the inherited val_mask is empty.
+    # build_compressed_data sets  val_mask = has_val & ~has_train,  which is
+    # nearly empty when train_ratio is high (ogbn-mag: 85% train).
+    # Must happen BEFORE loader creation so loaders see the updated masks.
+    _n_val_pre = data[target_type].val_mask.sum().item()
+    if _n_val_pre < 5 and orig_data is not None:
+        _resplit_supernodes(data, target_type, orig_data)
+
     train_loader = NeighborLoader(
         data,
         num_neighbors = num_neighbors,
@@ -738,10 +786,11 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     eval_every          = 10
     patience_steps      = max(patience // eval_every, 1)
 
-    # Detect empty val set (see full-batch path for explanation)
+    # Safety fallback: if val_mask is STILL empty after the resplit attempt above
+    # (e.g. orig_data was None), disable early stopping rather than crash.
     n_val = data[target_type].val_mask.sum().item()
     if n_val < 5:
-        print(f"  [WARNING] Only {int(n_val)} val supernodes — "
+        print(f"  [WARNING] Only {int(n_val)} val supernodes even after resplit attempt — "
               f"disabling early stopping, training full {epochs} epochs")
         patience_steps = epochs // eval_every + 1
 
@@ -863,6 +912,13 @@ def train_on_heterodata(data, target_type, device_str,
     dev = torch.device(
         ('cuda' if torch.cuda.is_available() else 'cpu')
         if device_str == 'auto' else device_str)
+
+    # Re-split supernodes proportionally when the inherited val_mask is empty.
+    # Must happen BEFORE clone+to(dev) so the GPU clone carries the new masks.
+    _n_val_pre = data[target_type].val_mask.sum().item()
+    if _n_val_pre < 5 and orig_data is not None:
+        _resplit_supernodes(data, target_type, orig_data)
+
     cdata = data.clone().to(dev)  # clone: PyG .to() is in-place, original must stay on CPU
 
     num_classes = int(cdata[target_type].y.max().item()) + 1
@@ -876,13 +932,11 @@ def train_on_heterodata(data, target_type, device_str,
     eval_every          = 10
     patience_steps      = max(patience // eval_every, 1)
 
-    # Detect empty val set — happens on compressed graphs when train ratio is
-    # high (e.g. ogbn-mag 85% train) and val_mask = has_val & ~has_train ≈ ∅.
-    # In that case val_acc = nan every step → no_improve always increments →
-    # early stop after patience_steps evaluations (~30 epochs) without learning.
+    # Safety fallback: if val_mask is STILL empty after the resplit attempt above
+    # (e.g. orig_data was None), disable early stopping rather than crash.
     n_val = cdata[target_type].val_mask.sum().item()
     if n_val < 5:
-        print(f"  [WARNING] Only {int(n_val)} val supernodes — "
+        print(f"  [WARNING] Only {int(n_val)} val supernodes even after resplit attempt — "
               f"disabling early stopping, training full {epochs} epochs")
         patience_steps = epochs // eval_every + 1   # effectively never stop
 
