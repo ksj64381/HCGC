@@ -656,15 +656,27 @@ def _resplit_supernodes(data, target_type, orig_data=None, seed=0):
     te_m[perm[n_tr + n_va:]]    = True
 
     print(f"  [re-split] val_mask was empty → re-split {n_super:,} supernodes: "
-          f"train={n_tr:,} / val={n_va:,} / test={n_super-n_tr-n_va:,}")
+          f"train={n_tr:,} ({tr_ratio*100:.1f}%) / "
+          f"val={n_va:,} ({va_ratio*100:.1f}%) / "
+          f"test={n_super-n_tr-n_va:,} ({(1-tr_ratio-va_ratio)*100:.1f}%)")
 
     data[target_type].train_mask = tr_m
     data[target_type].val_mask   = va_m
     data[target_type].test_mask  = te_m
 
+    # Show label stats so we can see if purity is good enough for learning
+    if hasattr(data[target_type], 'y') and data[target_type].y is not None:
+        y = data[target_type].y
+        if y.dtype == torch.long:
+            n_cls = int(y.max().item()) + 1
+            counts = torch.bincount(y, minlength=n_cls).float()
+            top1_pct = counts.max().item() / n_super * 100
+            print(f"  [re-split] supernode label dist: {n_cls} classes, "
+                  f"majority class={top1_pct:.1f}% of supernodes")
+
 
 def _train_mini_batch_downstream(data, target_type, device_str,
-                                  epochs=200, lr=1e-3, patience=30,
+                                  epochs=200, lr=1e-3, patience=None,
                                   hidden=256, batch_size=512,
                                   model_name='sage',
                                   orig_data=None, node_map=None):
@@ -672,6 +684,10 @@ def _train_mini_batch_downstream(data, target_type, device_str,
 
     Used automatically by train_on_heterodata when the graph has more than
     _FULL_BATCH_NODE_LIMIT total nodes (e.g. AMiner, ogbn-mag).
+
+    patience=None (default): run ALL epochs without early stopping — safest
+    for compressed graphs whose supernode val-labels are noisy majority votes.
+    Pass an explicit integer to re-enable early stopping (measured in epochs).
 
     Samples 2-hop neighbourhoods with at most 10 neighbours per edge type
     per hop; this keeps each mini-batch subgraph tractable while still
@@ -784,7 +800,15 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     best_state          = None
     no_improve          = 0
     eval_every          = 10
-    patience_steps      = max(patience // eval_every, 1)
+
+    # patience=None → run ALL epochs (patience_steps = epochs // eval_every means
+    # we'd need no improvement for the ENTIRE training to early-stop, which never
+    # happens within the epoch budget).  This is the safe default for compressed
+    # graphs whose supernode labels are noisy majority votes.
+    if patience is None:
+        patience_steps = epochs // eval_every  # effectively "never stop early"
+    else:
+        patience_steps = max(patience // eval_every, 1)
 
     # Safety fallback: if val_mask is STILL empty after the resplit attempt above
     # (e.g. orig_data was None), disable early stopping rather than crash.
@@ -849,9 +873,12 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     if orig_data is not None and node_map is not None and target_type in node_map:
         from torch_geometric.loader import NeighborLoader
         n_target = data[target_type].num_nodes
+        # Use dict format for hetero graphs so each edge type gets the same
+        # per-type neighbor count instead of a confusing flat list.
+        _inf_neighbors = {et: [10, 10] for et in data.edge_types}
         inf_loader = NeighborLoader(
             data,
-            num_neighbors   = [10, 10],
+            num_neighbors   = _inf_neighbors,
             batch_size      = batch_size * 4,
             input_nodes     = (target_type, torch.ones(n_target, dtype=torch.bool)),
             shuffle         = False,
@@ -877,7 +904,7 @@ def _train_mini_batch_downstream(data, target_type, device_str,
 
 
 def train_on_heterodata(data, target_type, device_str,
-                        epochs=200, lr=1e-3, patience=30, hidden=256,
+                        epochs=200, lr=1e-3, patience=None, hidden=256,
                         mini_batch_size=512, model_name='sage',
                         orig_data=None, node_map=None,
                         force_full_batch=False):
@@ -930,7 +957,12 @@ def train_on_heterodata(data, target_type, device_str,
     best_state          = None
     no_improve          = 0          # measured in eval steps, not epochs
     eval_every          = 10
-    patience_steps      = max(patience // eval_every, 1)
+
+    # patience=None → run ALL epochs (same logic as mini-batch path).
+    if patience is None:
+        patience_steps = epochs // eval_every   # effectively "never stop early"
+    else:
+        patience_steps = max(patience // eval_every, 1)
 
     # Safety fallback: if val_mask is STILL empty after the resplit attempt above
     # (e.g. orig_data was None), disable early stopping rather than crash.
@@ -1011,7 +1043,7 @@ def train_on_heterodata(data, target_type, device_str,
 
 
 def train_downstream(result, orig_data, target_type, device_str,
-                     epochs=200, lr=1e-3, patience=30, hidden=256,
+                     epochs=200, lr=1e-3, patience=None, hidden=256,
                      mini_batch_size=512, model_name='sage',
                      force_full_batch=False):
     """Train on a compressed HCGCResult; evaluate on original test-node labels.
@@ -1019,6 +1051,9 @@ def train_downstream(result, orig_data, target_type, device_str,
     Passes orig_data + result.node_map so the final accuracy is computed by
     mapping supernode predictions back to original node labels (the correct
     protocol for a coarsening benchmark).
+
+    patience=None (default): run all epochs without early stopping. Compressed
+    supernode labels are noisy majority votes, making early stopping unreliable.
     """
     return train_on_heterodata(result.data, target_type, device_str,
                                epochs=epochs, lr=lr, patience=patience,
@@ -1050,10 +1085,12 @@ def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
 
 def run_once(data, target_type, ratio, device, pretrain,
              train_epochs=200, train_hidden=256, verbose=False,
-             mini_batch_size=512, model_name='sage', force_full_batch=False):
+             mini_batch_size=512, model_name='sage', force_full_batch=False,
+             train_patience=None):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
+    train_patience=None (default): run all train_epochs, no early stopping.
     """
     # ── Compression ───────────────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -1081,6 +1118,7 @@ def run_once(data, target_type, ratio, device, pretrain,
         mini_batch_size  = mini_batch_size,
         model_name       = model_name,
         force_full_batch = force_full_batch,
+        patience         = train_patience,
     )
 
     n_orig = result.info['n_nodes_orig']
@@ -1144,6 +1182,11 @@ def main():
                              'even if the original does not. May OOM on the baseline run.')
     parser.add_argument('--model',    default='sage', choices=list(_DOWNSTREAM_MODELS),
                         help='Downstream GNN architecture for evaluation')
+    parser.add_argument('--train-patience', type=int, default=None,
+                        help='Early-stopping patience in epochs for downstream training. '
+                             'Default None = run all --train-epochs without early stopping '
+                             '(recommended for compressed graphs with noisy supernode labels). '
+                             'Use e.g. --train-patience 50 to re-enable early stopping.')
     parser.add_argument('--baseline', action='store_true',
                         help='Also train on the original graph and print speedup comparison')
     args = parser.parse_args()
@@ -1239,6 +1282,7 @@ def main():
             mini_batch_size  = args.mini_batch_size,
             model_name       = args.model,
             force_full_batch = args.force_full_batch,
+            train_patience   = args.train_patience,
         )
         records.append(r)
         print(
