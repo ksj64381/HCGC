@@ -498,24 +498,66 @@ def load_freebase(root):
         data[target_type].y = nd.y.squeeze(1)
     y = data[target_type].y
 
-    # ── Build masks if HGBDataset doesn't provide them ────────────────────────
-    # Older PyG versions may expose train_idx / val_idx / test_idx instead of masks.
-    for split, attr_mask, attr_idx in [
-        ('train', 'train_mask', 'train_idx'),
-        ('val',   'val_mask',   'val_idx'),
-        ('test',  'test_mask',  'test_idx'),
-    ]:
-        if not hasattr(nd, attr_mask) or getattr(nd, attr_mask) is None:
-            idx = getattr(nd, attr_idx, None)
-            if idx is not None:
-                m = torch.zeros(nd.num_nodes, dtype=torch.bool)
-                m[idx] = True
-                setattr(data[target_type], attr_mask, m)
-            else:
-                raise RuntimeError(
-                    f"Freebase: neither {attr_mask} nor {attr_idx} found "
-                    f"for node type {target_type!r}."
-                )
+    # ── Build masks — handle all PyG / HGB format variants ───────────────────
+    # PyG version differences:
+    #   New: bool tensors  data['book'].train_mask / val_mask / test_mask
+    #   Old: index tensors data['book'].train_idx  / val_idx  / test_idx
+    # HGB Freebase quirk: val split is not in the raw files — PyG only produces
+    #   train_mask + test_mask.  We carve out 20% of train as validation.
+    nd = data[target_type]
+
+    # Helper: idx tensor → bool mask
+    def _idx_to_mask(idx_attr):
+        idx = getattr(nd, idx_attr, None)
+        if idx is None:
+            return None
+        m = torch.zeros(nd.num_nodes, dtype=torch.bool)
+        m[idx] = True
+        return m
+
+    # train_mask
+    if getattr(nd, 'train_mask', None) is None:
+        m = _idx_to_mask('train_idx')
+        if m is None:
+            raise RuntimeError(f"Freebase: train_mask/train_idx not found "
+                               f"for node type {target_type!r}.\n"
+                               f"  Available keys: {list(nd.keys())}")
+        data[target_type].train_mask = m
+
+    # test_mask
+    if getattr(nd, 'test_mask', None) is None:
+        m = _idx_to_mask('test_idx')
+        if m is None:
+            raise RuntimeError(f"Freebase: test_mask/test_idx not found "
+                               f"for node type {target_type!r}.\n"
+                               f"  Available keys: {list(nd.keys())}")
+        data[target_type].test_mask = m
+
+    # val_mask — HGB Freebase raw format has no explicit val split
+    # → carve out 20% of training nodes (reproducible with seed=0)
+    nd = data[target_type]   # re-fetch
+    if getattr(nd, 'val_mask', None) is None:
+        m = _idx_to_mask('val_idx')
+        if m is not None:
+            data[target_type].val_mask = m
+        else:
+            # Create val by splitting train 80/20
+            train_idx = nd.train_mask.nonzero(as_tuple=True)[0]
+            gen = torch.Generator(); gen.manual_seed(0)
+            perm    = torch.randperm(len(train_idx), generator=gen)
+            n_val   = max(1, int(0.2 * len(train_idx)))
+            val_nodes   = train_idx[perm[:n_val]]
+            train_nodes = train_idx[perm[n_val:]]
+
+            val_m   = torch.zeros(nd.num_nodes, dtype=torch.bool)
+            train_m = torch.zeros(nd.num_nodes, dtype=torch.bool)
+            val_m[val_nodes]   = True
+            train_m[train_nodes] = True
+
+            data[target_type].val_mask   = val_m
+            data[target_type].train_mask = train_m
+            print(f"  [Freebase] val_mask absent in raw data — "
+                  f"carved {n_val:,} nodes from train as val (seed=0)")
 
     nd = data[target_type]   # re-fetch after possible setattr
     n_cls = int(y.max().item()) + 1
