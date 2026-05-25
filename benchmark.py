@@ -737,6 +737,14 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     no_improve          = 0
     eval_every          = 10
     patience_steps      = max(patience // eval_every, 1)
+
+    # Detect empty val set (see full-batch path for explanation)
+    n_val = data[target_type].val_mask.sum().item()
+    if n_val < 5:
+        print(f"  [WARNING] Only {int(n_val)} val supernodes — "
+              f"disabling early stopping, training full {epochs} epochs")
+        patience_steps = epochs // eval_every + 1
+
     t0 = time.perf_counter()
 
     ep_bar = _tqdm(range(1, epochs + 1), desc='  train', unit='ep',
@@ -867,6 +875,16 @@ def train_on_heterodata(data, target_type, device_str,
     no_improve          = 0          # measured in eval steps, not epochs
     eval_every          = 10
     patience_steps      = max(patience // eval_every, 1)
+
+    # Detect empty val set — happens on compressed graphs when train ratio is
+    # high (e.g. ogbn-mag 85% train) and val_mask = has_val & ~has_train ≈ ∅.
+    # In that case val_acc = nan every step → no_improve always increments →
+    # early stop after patience_steps evaluations (~30 epochs) without learning.
+    n_val = cdata[target_type].val_mask.sum().item()
+    if n_val < 5:
+        print(f"  [WARNING] Only {int(n_val)} val supernodes — "
+              f"disabling early stopping, training full {epochs} epochs")
+        patience_steps = epochs // eval_every + 1   # effectively never stop
 
     t0 = time.perf_counter()
 
