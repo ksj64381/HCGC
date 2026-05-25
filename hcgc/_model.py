@@ -286,7 +286,9 @@ def train_full_batch(model, hdata, epochs, lr, desc='',
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _default_num_neighbors(data):
-    return {et: [10, 5] for et in data.edge_types}
+    # [5, 3] keeps subgraphs manageable on dense hetero graphs (e.g. ogbn-mag
+    # 7 edge types). Matches the downstream training setting in benchmark.py.
+    return {et: [5, 3] for et in data.edge_types}
 
 
 def train_mini_batch(model, data, epochs, lr,
@@ -300,6 +302,9 @@ def train_mini_batch(model, data, epochs, lr,
     if num_neighbors is None:
         num_neighbors = _default_num_neighbors(data)
 
+    import os as _os
+    _n_workers = 4 if _os.name == 'posix' else 0
+
     train_mask = data[tt].train_mask
     train_loader = NeighborLoader(
         data,
@@ -307,7 +312,7 @@ def train_mini_batch(model, data, epochs, lr,
         batch_size=batch_size,
         input_nodes=(tt, train_mask),
         shuffle=True,
-        num_workers=0,
+        num_workers=_n_workers,
     )
 
     soft_y = None
@@ -394,6 +399,9 @@ def _eval_mini_batch(model, data, batch_size=512, num_neighbors=None):
     if num_neighbors is None:
         num_neighbors = _default_num_neighbors(data)
 
+    import os as _os
+    _n_workers = 4 if _os.name == 'posix' else 0
+
     n_nodes = data[tt].num_nodes
     all_nodes_mask = torch.ones(n_nodes, dtype=torch.bool)
     inf_loader = NeighborLoader(
@@ -402,7 +410,7 @@ def _eval_mini_batch(model, data, batch_size=512, num_neighbors=None):
         batch_size=batch_size,
         input_nodes=(tt, all_nodes_mask),
         shuffle=False,
-        num_workers=0,
+        num_workers=_n_workers,
     )
 
     model.eval()
