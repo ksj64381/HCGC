@@ -822,11 +822,14 @@ def _train_mini_batch_downstream(data, target_type, device_str,
 def train_on_heterodata(data, target_type, device_str,
                         epochs=200, lr=1e-3, patience=30, hidden=256,
                         mini_batch_size=512, model_name='sage',
-                        orig_data=None, node_map=None):
+                        orig_data=None, node_map=None,
+                        force_full_batch=False):
     """Train a 2-layer HeteroSAGE on any HeteroData object.
 
     Automatically switches to mini-batch (NeighborLoader) mode when the
     total node count exceeds _FULL_BATCH_NODE_LIMIT (100 k) to avoid OOM.
+    Pass force_full_batch=True to skip this check (e.g. when the compressed
+    graph fits in GPU memory even though the original does not).
 
     When orig_data and node_map are provided (compress() result), the final
     test accuracy is computed by mapping supernode predictions back to original
@@ -840,7 +843,7 @@ def train_on_heterodata(data, target_type, device_str,
     elapsed  : float   wall-clock seconds (model init + all epochs)
     """
     n_total = sum(data[nt].num_nodes for nt in data.node_types)
-    if n_total > _FULL_BATCH_NODE_LIMIT:
+    if n_total > _FULL_BATCH_NODE_LIMIT and not force_full_batch:
         return _train_mini_batch_downstream(
             data, target_type, device_str,
             epochs=epochs, lr=lr, patience=patience, hidden=hidden,
@@ -937,7 +940,8 @@ def train_on_heterodata(data, target_type, device_str,
 
 def train_downstream(result, orig_data, target_type, device_str,
                      epochs=200, lr=1e-3, patience=30, hidden=256,
-                     mini_batch_size=512, model_name='sage'):
+                     mini_batch_size=512, model_name='sage',
+                     force_full_batch=False):
     """Train on a compressed HCGCResult; evaluate on original test-node labels.
 
     Passes orig_data + result.node_map so the final accuracy is computed by
@@ -948,7 +952,8 @@ def train_downstream(result, orig_data, target_type, device_str,
                                epochs=epochs, lr=lr, patience=patience,
                                hidden=hidden, mini_batch_size=mini_batch_size,
                                model_name=model_name,
-                               orig_data=orig_data, node_map=result.node_map)
+                               orig_data=orig_data, node_map=result.node_map,
+                               force_full_batch=force_full_batch)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -956,7 +961,7 @@ def train_downstream(result, orig_data, target_type, device_str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
-                 mini_batch_size=512, model_name='sage'):
+                 mini_batch_size=512, model_name='sage', force_full_batch=False):
     """Train on the original (uncompressed) graph. Returns (test_acc, elapsed).
 
     Uses a generous patience (= train_epochs // 5) so the model trains until
@@ -967,12 +972,13 @@ def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
                                epochs=train_epochs, hidden=train_hidden,
                                patience=train_epochs // 5,
                                mini_batch_size=mini_batch_size,
-                               model_name=model_name)
+                               model_name=model_name,
+                               force_full_batch=force_full_batch)
 
 
 def run_once(data, target_type, ratio, device, pretrain,
              train_epochs=200, train_hidden=256, verbose=False,
-             mini_batch_size=512, model_name='sage'):
+             mini_batch_size=512, model_name='sage', force_full_batch=False):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
@@ -997,11 +1003,12 @@ def run_once(data, target_type, ratio, device, pretrain,
     # not supernode majority-vote labels.
     test_acc, t_train = train_downstream(
         result, data, target_type,
-        device_str      = device,
-        epochs          = train_epochs,
-        hidden          = train_hidden,
-        mini_batch_size = mini_batch_size,
-        model_name      = model_name,
+        device_str       = device,
+        epochs           = train_epochs,
+        hidden           = train_hidden,
+        mini_batch_size  = mini_batch_size,
+        model_name       = model_name,
+        force_full_batch = force_full_batch,
     )
 
     n_orig = result.info['n_nodes_orig']
@@ -1059,6 +1066,10 @@ def main():
     parser.add_argument('--mini-batch-size', type=int, default=512,
                         help='Seed-node batch size for downstream GNN training on large graphs '
                              '(>100 k nodes). Reduce if GPU OOM on dense graphs.')
+    parser.add_argument('--force-full-batch', action='store_true',
+                        help='Skip the 100k-node threshold and force full-batch downstream '
+                             'training. Useful when the compressed graph fits in GPU memory '
+                             'even if the original does not. May OOM on the baseline run.')
     parser.add_argument('--model',    default='sage', choices=list(_DOWNSTREAM_MODELS),
                         help='Downstream GNN architecture for evaluation')
     parser.add_argument('--baseline', action='store_true',
@@ -1091,8 +1102,12 @@ def main():
     print(f"  total nodes: {n_nodes:,}   total edges: {n_edges:,}")
     print(f"  target type: {target_type!r}")
     if n_nodes > _FULL_BATCH_NODE_LIMIT:
-        print(f"  [large graph — downstream GNN will use mini-batch "
-              f"(batch_size={args.mini_batch_size})]")
+        if args.force_full_batch:
+            print(f"  [large graph — --force-full-batch set: skipping mini-batch threshold]")
+            print(f"  [WARNING] Baseline full-batch on {n_nodes:,} nodes may OOM on GPU]")
+        else:
+            print(f"  [large graph — downstream GNN will use mini-batch "
+                  f"(batch_size={args.mini_batch_size})]")
 
     # ── Baseline (original graph training) ───────────────────────────────────
     base_records = []
@@ -1104,7 +1119,8 @@ def main():
                                   train_epochs=args.train_epochs,
                                   train_hidden=args.train_hidden,
                                   mini_batch_size=args.mini_batch_size,
-                                  model_name=args.model)
+                                  model_name=args.model,
+                                  force_full_batch=args.force_full_batch)
             base_records.append({'t_train': t, 'test_acc': acc})
             print(f"t={t:.1f}s  test_acc={acc:.4f}")
 
@@ -1122,7 +1138,8 @@ def main():
                      ratio=args.ratio, device=args.device,
                      pretrain=False, verbose=False,
                      mini_batch_size=args.mini_batch_size,
-                     model_name=args.model)
+                     model_name=args.model,
+                     force_full_batch=args.force_full_batch)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
@@ -1130,7 +1147,8 @@ def main():
                      ratio=args.ratio, device=args.device,
                      pretrain=pretrain, verbose=False,
                      mini_batch_size=args.mini_batch_size,
-                     model_name=args.model)
+                     model_name=args.model,
+                     force_full_batch=args.force_full_batch)
             print(f"  warmup {i+1}/{args.warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Timed runs ────────────────────────────────────────────────────────────
@@ -1140,14 +1158,15 @@ def main():
         print(f"  run {i+1}/{args.runs} ... ", end='', flush=True)
         r = run_once(
             data, target_type,
-            ratio           = args.ratio,
-            device          = args.device,
-            pretrain        = pretrain,
-            train_epochs    = args.train_epochs,
-            train_hidden    = args.train_hidden,
-            verbose         = False,
-            mini_batch_size = args.mini_batch_size,
-            model_name      = args.model,
+            ratio            = args.ratio,
+            device           = args.device,
+            pretrain         = pretrain,
+            train_epochs     = args.train_epochs,
+            train_hidden     = args.train_hidden,
+            verbose          = False,
+            mini_batch_size  = args.mini_batch_size,
+            model_name       = args.model,
+            force_full_batch = args.force_full_batch,
         )
         records.append(r)
         print(
