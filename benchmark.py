@@ -440,13 +440,108 @@ def load_acm(root):
     return data, 'paper'
 
 
+def load_freebase(root):
+    """Load HGBn-Freebase: ~180k nodes, 8 types, 4 classes on book nodes.
+
+    Freebase is a large knowledge graph with no precomputed node features.
+    _add_degree_features() (called in main) injects a log-degree feature for
+    every node type so the pipeline never sees a missing .x.
+
+    Dataset stats (from the HGB benchmark, Lv et al. 2021):
+      node types : 8  (book, film, music, sports, people,
+                       location, organization, business)
+      total nodes: ~180k
+      target type: book  (4 classes)
+      edges      : ~1M (much sparser than ogbn-mag → fast training)
+
+    The HGB split is semi-supervised: few labeled training nodes, large test.
+    Because train_ratio is low the inherited val_mask from build_compressed_data
+    is NOT empty (unlike ogbn-mag), so _resplit_supernodes usually won't trigger.
+    """
+    try:
+        from torch_geometric.datasets import HGBDataset
+    except ImportError:
+        sys.exit(
+            "Freebase requires PyG >= 2.1 with HGBDataset.\n"
+            "  pip install torch_geometric"
+        )
+
+    print("  [Freebase] Loading via HGBDataset (downloads on first run) ...")
+    dataset = HGBDataset(root=f'{root}/Freebase', name='Freebase')
+    data    = dataset[0]
+
+    # ── Auto-detect target node type (first type with y + train_mask) ─────────
+    target_type = None
+    for nt in data.node_types:
+        nd = data[nt]
+        if (getattr(nd, 'y', None) is not None
+                and getattr(nd, 'train_mask', None) is not None):
+            target_type = nt
+            break
+
+    if target_type is None:
+        # Fall back: any type with y
+        for nt in data.node_types:
+            if getattr(data[nt], 'y', None) is not None:
+                target_type = nt
+                break
+
+    if target_type is None:
+        raise RuntimeError(
+            f"Could not detect target node type in Freebase.\n"
+            f"  Available node types: {data.node_types}"
+        )
+
+    # ── Normalise y ───────────────────────────────────────────────────────────
+    nd = data[target_type]
+    if nd.y.dim() == 2:
+        data[target_type].y = nd.y.squeeze(1)
+    y = data[target_type].y
+
+    # ── Build masks if HGBDataset doesn't provide them ────────────────────────
+    # Older PyG versions may expose train_idx / val_idx / test_idx instead of masks.
+    for split, attr_mask, attr_idx in [
+        ('train', 'train_mask', 'train_idx'),
+        ('val',   'val_mask',   'val_idx'),
+        ('test',  'test_mask',  'test_idx'),
+    ]:
+        if not hasattr(nd, attr_mask) or getattr(nd, attr_mask) is None:
+            idx = getattr(nd, attr_idx, None)
+            if idx is not None:
+                m = torch.zeros(nd.num_nodes, dtype=torch.bool)
+                m[idx] = True
+                setattr(data[target_type], attr_mask, m)
+            else:
+                raise RuntimeError(
+                    f"Freebase: neither {attr_mask} nor {attr_idx} found "
+                    f"for node type {target_type!r}."
+                )
+
+    nd = data[target_type]   # re-fetch after possible setattr
+    n_cls = int(y.max().item()) + 1
+    n_tot = sum(data[nt].num_nodes for nt in data.node_types)
+    n_edges = sum(data[et].edge_index.shape[1] for et in data.edge_types)
+
+    print(f"  [Freebase] target={target_type!r}  "
+          f"nodes={nd.num_nodes:,}  classes={n_cls}")
+    print(f"  [Freebase] train={nd.train_mask.sum():,}  "
+          f"val={nd.val_mask.sum():,}  "
+          f"test={nd.test_mask.sum():,}")
+    print(f"  [Freebase] total nodes={n_tot:,}  "
+          f"edge types={len(data.edge_types)}  "
+          f"total edges={n_edges:,}")
+
+    return data, target_type
+
+
 LOADERS = {
-    'imdb':     load_imdb,
-    'dblp':     load_dblp,
-    'lastfm':   load_lastfm,
-    'ogbn-mag': load_ogbn_mag,
-    'aminer':   load_aminer,
-    'acm':      load_acm,
+    'imdb':      load_imdb,
+    'dblp':      load_dblp,
+    'lastfm':    load_lastfm,
+    'ogbn-mag':  load_ogbn_mag,
+    'aminer':    load_aminer,
+    'acm':       load_acm,
+    'freebase':  load_freebase,
 }
 
 
