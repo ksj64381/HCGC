@@ -7,8 +7,11 @@ and prints a comparison table.  Keeps benchmark.py clean (single-ratio only).
 
 Usage
 -----
-    # ratio sweep on IMDB (with baseline)
+    # ratio sweep on IMDB (with baseline), single model
     python experiments.py --dataset imdb --ratios 0.5 0.4 0.3 0.25 0.2 0.15 0.1
+
+    # multi-model sweep: one table per model, summary table at the end
+    python experiments.py --dataset dblp --ratios 0.3 0.1 --models sage hgt gat rgcn
 
     # quick smoke test (1 run, no warmup)
     python experiments.py --dataset dblp --ratios 0.3 0.2 0.1 --runs 1 --warmup 0
@@ -227,29 +230,100 @@ def main():
     parser.add_argument('--train-hidden', type=int, default=256)
     parser.add_argument('--mini-batch-size', type=int, default=512)
     parser.add_argument('--model',    default='sage', choices=list(_DOWNSTREAM_MODELS),
-                        help='Downstream GNN architecture for evaluation')
+                        help='Downstream GNN architecture (ignored when --models is used)')
+    parser.add_argument('--models',   nargs='+', choices=list(_DOWNSTREAM_MODELS),
+                        metavar='M',
+                        help='One or more GNN models to compare. Overrides --model. '
+                             'Runs a sweep for each model; prints a cross-model summary table. '
+                             f'Choices: {list(_DOWNSTREAM_MODELS)}')
     parser.add_argument('--no-baseline', action='store_true',
                         help='Skip original-graph baseline training')
     args = parser.parse_args()
 
-    ratios = sorted(args.ratios, reverse=True)   # high → low (less → more aggressive)
+    ratios   = sorted(args.ratios, reverse=True)   # high → low (less → more compressed)
+    models   = args.models if args.models else [args.model]
+    do_base  = not args.no_baseline
 
-    base_stats, sweep = run_sweep(
-        dataset         = args.dataset,
-        ratios          = ratios,
-        runs            = args.runs,
-        warmup          = args.warmup,
-        device          = args.device,
-        root            = args.root,
-        pretrain        = not args.no_pretrain,
-        train_epochs    = args.train_epochs,
-        train_hidden    = args.train_hidden,
-        mini_batch_size = args.mini_batch_size,
-        model_name      = args.model,
-        baseline        = not args.no_baseline,
-    )
+    if len(models) == 1:
+        # ── Single-model path (original behaviour) ────────────────────────────
+        base_stats, sweep = run_sweep(
+            dataset         = args.dataset,
+            ratios          = ratios,
+            runs            = args.runs,
+            warmup          = args.warmup,
+            device          = args.device,
+            root            = args.root,
+            pretrain        = not args.no_pretrain,
+            train_epochs    = args.train_epochs,
+            train_hidden    = args.train_hidden,
+            mini_batch_size = args.mini_batch_size,
+            model_name      = models[0],
+            baseline        = do_base,
+        )
+        print_sweep_table(base_stats, sweep, args.dataset)
 
-    print_sweep_table(base_stats, sweep, args.dataset)
+    else:
+        # ── Multi-model path ──────────────────────────────────────────────────
+        # Collect results per model, then print a cross-model summary table.
+        # Baseline is measured ONCE per model (it also depends on the model arch).
+        all_results = {}   # model_name -> (base_stats, sweep)
+
+        for mi, mname in enumerate(models):
+            print(f"\n{'#'*68}")
+            print(f"  Model {mi+1}/{len(models)}: {mname.upper()}")
+            print(f"{'#'*68}")
+            base_stats, sweep = run_sweep(
+                dataset         = args.dataset,
+                ratios          = ratios,
+                runs            = args.runs,
+                warmup          = args.warmup if mi == 0 else 0,  # warmup once
+                device          = args.device,
+                root            = args.root,
+                pretrain        = not args.no_pretrain,
+                train_epochs    = args.train_epochs,
+                train_hidden    = args.train_hidden,
+                mini_batch_size = args.mini_batch_size,
+                model_name      = mname,
+                baseline        = do_base,
+            )
+            print_sweep_table(base_stats, sweep, args.dataset)
+            all_results[mname] = (base_stats, sweep)
+
+        # ── Cross-model summary ───────────────────────────────────────────────
+        W = 72
+        print(f"\n{'='*W}")
+        print(f"  MULTI-MODEL SUMMARY   dataset={args.dataset}   ratios={ratios}")
+        print(f"{'='*W}")
+
+        # Header row: model names
+        ratio_col_w = 8
+        model_col_w = 16   # "0.XXXX±0.XXXX" = 13 chars + padding
+        header = f"  {'ratio':>{ratio_col_w}}"
+        for mname in models:
+            header += f"  {mname.upper():^{model_col_w}}"
+        print(header)
+
+        # Baseline row
+        bline_row = f"  {'baseline':>{ratio_col_w}}"
+        for mname in models:
+            bs, _ = all_results[mname]
+            if bs is not None:
+                bline_row += f"  {bs['acc_mean']:6.4f}±{bs['acc_std']:.4f}  "
+            else:
+                bline_row += f"  {'—':^{model_col_w}}"
+        print(bline_row)
+        print(f"  {'─'*ratio_col_w}" + f"  {'─'*model_col_w}" * len(models))
+
+        # One row per ratio
+        for ri, ratio in enumerate(ratios):
+            row = f"  {ratio:>{ratio_col_w}.2f}"
+            for mname in models:
+                _, sweep = all_results[mname]
+                entry = sweep[ri]
+                row += f"  {entry['acc_mean']:6.4f}±{entry['acc_std']:.4f}  "
+            print(row)
+
+        print(f"{'='*W}\n")
 
 
 if __name__ == '__main__':
