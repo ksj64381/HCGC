@@ -1444,28 +1444,37 @@ def main():
 
     r0 = records[0]
 
-    print(f"\n{'='*W}")
-    print(f"  RESULTS   dataset={args.dataset}  ratio={args.ratio}  ({args.runs} runs)")
-    print(f"{'='*W}")
-    print(f"  {'Nodes':<28}: {r0['n_nodes_orig']:>10,}  ->  {r0['n_nodes_comp']:>8,}")
-    print(f"  {'Edges':<28}: {r0['edges_orig']:>10,}  ->  {r0['edges_comp']:>8,}")
-    print()
     node_m, node_s = stat('node_ratio')
     edge_m, edge_s = stat('edge_ratio')
     comp_m, comp_s = stat('compression')
-    print(f"  {'Node retention ratio':<28}: {_fmt(node_m, node_s)}   ({comp_m:.2f}x compression)")
-    print(f"  {'Edge retention ratio':<28}: {_fmt(edge_m, edge_s)}")
-    print()
+    # Effective (edge-based) compression: GNN training cost scales with |E|,
+    # so edge compression is the primary driver of training speedup.
+    edge_comp_m = 1.0 / max(edge_m, 1e-9)
+    edge_comp_s = edge_comp_m * (edge_s / max(edge_m, 1e-9))
+
     tc_m,  tc_s  = stat('t_compress')
     tco_m, tco_s = stat('t_coarsen')
     tt_m,  tt_s  = stat('t_train')
     tot_m, tot_s = stat('t_total')
+    acc_m, acc_s = stat('test_acc')
+
+    print(f"\n{'='*W}")
+    print(f"  RESULTS   dataset={args.dataset}  "
+          f"target_ratio={args.ratio} ({1/args.ratio:.0f}x)  ({args.runs} runs)")
+    print(f"{'='*W}")
+    print(f"  {'Nodes':<28}: {r0['n_nodes_orig']:>10,}  ->  {r0['n_nodes_comp']:>8,}")
+    print(f"  {'Edges':<28}: {r0['edges_orig']:>10,}  ->  {r0['edges_comp']:>8,}")
+    print()
+    print(f"  {'Node compression (actual)':<28}: {comp_m:.2f}x ± {comp_s:.2f}x"
+          f"  (node ratio {node_m:.3f} ± {node_s:.3f})")
+    print(f"  {'Edge compression (actual)':<28}: {edge_comp_m:.2f}x ± {edge_comp_s:.2f}x"
+          f"  (edge ratio {edge_m:.3f} ± {edge_s:.3f})")
+    print()
     print(f"  {'Time  compress() total':<28}: {_fmt(tc_m,  tc_s,  '.1f')} s"
           f"  (coarsen kernel: {tco_m:.1f} ± {tco_s:.1f} s)")
     print(f"  {'Time  train on comp. graph':<28}: {_fmt(tt_m,  tt_s,  '.1f')} s")
     print(f"  {'Time  total':<28}: {_fmt(tot_m, tot_s, '.1f')} s")
     print()
-    acc_m, acc_s = stat('test_acc')
     print(f"  {'Test accuracy':<28}: {_fmt(acc_m, acc_s, '.4f')}")
 
     # ── Baseline comparison ───────────────────────────────────────────────────
@@ -1477,7 +1486,8 @@ def main():
 
         train_speedup = b_t_m / max(tt_m, 1e-6)
         total_speedup = b_t_m / max(tot_m, 1e-6)
-        acc_drop      = acc_m - b_acc_m   # negative = drop
+        acc_retention = acc_m / max(b_acc_m, 1e-9)   # fraction of baseline accuracy kept
+        acc_drop      = acc_m - b_acc_m               # signed delta (negative = drop)
 
         print()
         print(f"  {'─'*58}")
@@ -1489,7 +1499,7 @@ def main():
         print(f"  {'Total time (incl. compress)':<28}  {b_t_m:>9.1f}s  {tot_m:>9.1f}s"
               f"  ({total_speedup:.2f}x)")
         print(f"  {'Test accuracy':<28}  {b_acc_m:>10.4f}  {acc_m:>10.4f}"
-              f"  ({acc_drop:+.4f})")
+              f"  ({acc_drop:+.4f},  {acc_retention*100:.1f}% retained)")
 
     print(f"{'='*W}\n")
 
