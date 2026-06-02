@@ -1496,6 +1496,8 @@ def run_once(data, target_type, ratio, device, pretrain,
         'oracle_n_supernodes': oracle['oracle_n_supernodes'],
         'oracle_mixed_frac': oracle['oracle_mixed_frac'],
         'oracle_mean_purity': oracle['oracle_mean_purity'],
+        'target_emb_distortion': result.info.get('target_emb_distortion', float('nan')),
+        'target_emb_cosine': result.info.get('target_emb_cosine', float('nan')),
         'n_nodes_orig': n_orig,
         'n_nodes_comp': n_comp,
         'edges_orig':   e_orig,
@@ -1779,6 +1781,8 @@ def main():
     ogap_m, ogap_s = stat('oracle_gap')
     omix_m, omix_s = stat('oracle_mixed_frac')
     opur_m, opur_s = stat('oracle_mean_purity')
+    ed_m, ed_s = stat('target_emb_distortion')
+    ec_m, ec_s = stat('target_emb_cosine')
 
     print(f"\n{'='*W}")
     print(f"  RESULTS   dataset={args.dataset}  "
@@ -1803,6 +1807,8 @@ def main():
           f"  (gap {ogap_m:+.4f} 짹 {ogap_s:.4f})")
     print(f"  {'Oracle mixed supernodes':<28}: {_fmt(omix_m, omix_s, '.3f')}"
           f"  (mean purity {_fmt(opur_m, opur_s, '.3f')})")
+    print(f"  {'Target emb distortion':<28}: {_fmt(ed_m, ed_s, '.4f')}"
+          f"  (cosine {_fmt(ec_m, ec_s, '.4f')})")
 
     # ── Baseline comparison ───────────────────────────────────────────────────
     if base_records:

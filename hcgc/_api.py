@@ -204,6 +204,8 @@ def compress(
         emb_dict=ctx['emb_dict'] if pretrain else None,
         edge_weight_mode=edge_weight_mode,
     )
+    emb_diag = _target_embedding_diagnostics(
+        ctx.get('emb_dict'), local_cm, _CFG.target_type)
     if verbose:
         print(f"[HCGC] build_compressed_data:{time.perf_counter()-_t:.2f}s")
 
@@ -222,6 +224,8 @@ def compress(
         'edges_comp':   stats['edges_comp'],
         'edge_ratio':   round(stats['edge_ratio'], 4),
         'freeze_node_types': list(freeze_node_types or []),
+        'target_emb_distortion': emb_diag['distortion'],
+        'target_emb_cosine': emb_diag['cosine'],
     }
 
     if verbose:
@@ -293,6 +297,39 @@ def _apply_freeze_node_types(cm, offsets, type_boundaries, node_types,
               f"(minimum possible ratio {min_ratio:.3f}, "
               f"{1.0 / max(min_ratio, 1e-9):.1f}x max)")
     return cm
+
+
+def _target_embedding_diagnostics(emb_dict, local_cm, target_type):
+    """Label-free target-resolution diagnostics from coarsening embeddings."""
+    empty = {'distortion': float('nan'), 'cosine': float('nan')}
+    if not emb_dict or target_type not in emb_dict or target_type not in local_cm:
+        return empty
+
+    h = emb_dict[target_type].detach().float().cpu()
+    lc = local_cm[target_type].detach().cpu().long()
+    if h.numel() == 0 or lc.numel() == 0:
+        return empty
+
+    ns = int(lc.max().item()) + 1
+    ctr = torch.zeros(ns, h.shape[1], dtype=h.dtype)
+    cnt = torch.zeros(ns, 1, dtype=h.dtype)
+    ctr.scatter_add_(0, lc.unsqueeze(1).expand(-1, h.shape[1]), h)
+    cnt.scatter_add_(0, lc.unsqueeze(1), torch.ones(len(h), 1, dtype=h.dtype))
+    ctr = ctr / cnt.clamp(min=1)
+
+    diff = h - ctr[lc]
+    mse = (diff * diff).sum(dim=1).mean()
+    centered = h - h.mean(dim=0, keepdim=True)
+    var = (centered * centered).sum(dim=1).mean().clamp(min=1e-12)
+
+    h_norm = h.norm(dim=1).clamp(min=1e-12)
+    c_norm = ctr[lc].norm(dim=1).clamp(min=1e-12)
+    cosine = ((h * ctr[lc]).sum(dim=1) / (h_norm * c_norm)).mean()
+
+    return {
+        'distortion': float((mse / var).item()),
+        'cosine': float(cosine.item()),
+    }
 
 
 def _detect_target_type(data, target_type):
