@@ -255,11 +255,14 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir):
     if not plot_dir:
         return None
     import json
+    import csv
     import subprocess
 
     out_dir = Path(plot_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"proxy_sweep_{dataset}_{model_name}.png"
+    json_path = out_dir / f"proxy_sweep_{dataset}_{model_name}.json"
+    csv_path = out_dir / f"proxy_sweep_{dataset}_{model_name}.csv"
 
     x = np.array([e['comp_mean'] for e in sweep], dtype=float)
     order = np.argsort(x)
@@ -277,6 +280,17 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir):
         'title': f'{dataset} {model_name} compression proxy sweep',
         'out': str(out_path),
     }
+    with json_path.open('w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+    with csv_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['compression', 'test_acc', 'val_oracle',
+                         'test_oracle', 'emb_dist'])
+        for row in zip(payload['x'], payload['acc'], payload['val_oracle'],
+                       payload['test_oracle'], payload['emb_dist']):
+            writer.writerow(row)
+    print(f"  [plot] saved data {csv_path}")
+
     script = r"""
 import json, sys
 import matplotlib
@@ -304,11 +318,12 @@ fig.savefig(p['out'], dpi=180)
 plt.close(fig)
 """
     try:
-        subprocess.run([sys.executable, '-c', script, json.dumps(payload)],
-                       check=True)
+        proc = subprocess.run(
+            [sys.executable, '-c', script, json.dumps(payload)],
+            check=True, capture_output=True, text=True)
     except Exception as exc:
-        print(f"  [plot] failed to save plot: {exc}")
-        return None
+        print(f"  [plot] PNG skipped: matplotlib is unavailable or failed ({exc})")
+        return csv_path
     print(f"  [plot] saved {out_path}")
     return out_path
 
