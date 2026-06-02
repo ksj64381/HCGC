@@ -32,10 +32,21 @@ def compress(
     target_type     = None,
     pretrain        = True,
     pretrain_epochs = 100,
+    pretrain_patience = 5,
+    emb_method      = 'gnn',
+    coarsen_l2_normalize = True,
+    relprop_hops    = 2,
+    relprop_outdim  = 128,
     device          = 'auto',
     verbose         = True,
     mini_batch_size = 512,
     num_neighbors   = None,
+    use_soft_labels = False,
+    pairwise_merge  = False,
+    type_thresholds = False,
+    metapath_thresholds = False,
+    edge_weight_mode = 'binary',
+    freeze_node_types = None,
 ) -> HCGCResult:
     """Compress a heterogeneous graph using HCGC.
 
@@ -54,6 +65,19 @@ def compress(
         pretrain_epochs : Max pretrain epochs (used when pretrain=True and
                           the graph is small enough for full-batch training).
                           Early stopping applies; actual epochs may be fewer.
+        pretrain_patience
+                        : Early-stopping patience for the embedding pretrain.
+                          Evaluation happens every 10 epochs, so values below
+                          10 stop after a single non-improving evaluation.
+        emb_method      : Coarsening representation when pretrain=True:
+                          'gnn' (default), 'fast', 'relprop', or 'metapath2vec'.
+                          'relprop' is training-free relation-aware propagation.
+        coarsen_l2_normalize
+                        : If False, raw-feature coarsening keeps feature scale.
+                          Useful for ablations where 1-D degree features would
+                          collapse under row-wise L2 normalization.
+        relprop_hops    : Number of propagation hops for emb_method='relprop'.
+        relprop_outdim  : Output dimension for emb_method='relprop'.
         device          : Compute device: 'auto', 'cpu', or 'cuda'.
                           'auto' selects CUDA if available.
         verbose         : Print progress messages.
@@ -63,6 +87,30 @@ def compress(
         num_neighbors   : Neighbours to sample per hop in mini-batch mode.
                           None = auto (10 per hop). Pass a list e.g. [10, 5]
                           to control per-hop sampling and reduce subgraph size.
+        use_soft_labels : If True, attach class-proportion soft labels to
+                          compressed supernodes. Downstream training code must
+                          read .soft_y for this to affect accuracy.
+        pairwise_merge  : If True, cap each Ball Multi-Merge leader to the
+                          single cheapest eligible merge under marginal join
+                          cost. This is a CGC-like one-by-one coalition
+                          formation ablation.
+        type_thresholds : If True, estimate per-source-type merge threshold
+                          bases from mediator-pair energy samples, then use
+                          one global multiplier for target-ratio control.
+        metapath_thresholds
+                        : If True, estimate per-(source type, mediator type)
+                          threshold bases. This is closer to the old
+                          metapath-specific threshold calibration and takes
+                          precedence over type_thresholds.
+        edge_weight_mode
+                        : Compressed edge weighting mode. 'binary' keeps the
+                          current deduplicated quotient graph. 'count',
+                          'log_count', and 'density' preserve collapsed edge
+                          multiplicity as super-edge weights.
+        freeze_node_types
+                        : Optional iterable of node-type names that must not
+                          be compressed. Their original nodes are mapped to
+                          identity singleton supernodes after coarsening.
 
     Returns:
         HCGCResult with:
@@ -119,8 +167,17 @@ def compress(
     # ── Build args ────────────────────────────────────────────────────────────
     args = _build_args(ratio=ratio, pretrain=pretrain,
                        pretrain_epochs=pretrain_epochs,
+                       pretrain_patience=pretrain_patience,
+                       emb_method=emb_method,
+                       coarsen_l2_normalize=coarsen_l2_normalize,
+                       relprop_hops=relprop_hops,
+                       relprop_outdim=relprop_outdim,
                        mini_batch_size=mini_batch_size,
-                       num_neighbors=num_neighbors)
+                       num_neighbors=num_neighbors,
+                       use_soft_labels=use_soft_labels,
+                       pairwise_merge=pairwise_merge,
+                       type_thresholds=type_thresholds,
+                       metapath_thresholds=metapath_thresholds)
 
     # ── Pretrain (or fast-embed) + extract flat arrays ────────────────────────
     _t = time.perf_counter()
@@ -134,19 +191,24 @@ def compress(
     if verbose:
         print(f"[HCGC] coarsen_from_context: {time.perf_counter()-_t:.2f}s")
 
+    cm = _apply_freeze_node_types(
+        cm, ctx['offsets'], ctx['type_boundaries'], _CFG.node_types,
+        freeze_node_types, verbose)
+
     # ── Build compressed HeteroData ───────────────────────────────────────────
     _t = time.perf_counter()
     cdata, local_cm, stats = build_compressed_data(
         data, cm,
         ctx['offsets'], ctx['type_boundaries'],
-        use_soft_labels=False,
+        use_soft_labels=use_soft_labels,
         emb_dict=ctx['emb_dict'] if pretrain else None,
+        edge_weight_mode=edge_weight_mode,
     )
     if verbose:
         print(f"[HCGC] build_compressed_data:{time.perf_counter()-_t:.2f}s")
 
     n_orig = int(ctx['type_boundaries'][-1])
-    n_comp = len(np.unique(cm))
+    n_comp = int(stats['nodes_comp'])
     actual_ratio = n_comp / n_orig
 
     info = {
@@ -159,6 +221,7 @@ def compress(
         'edges_orig':   stats['edges_orig'],
         'edges_comp':   stats['edges_comp'],
         'edge_ratio':   round(stats['edge_ratio'], 4),
+        'freeze_node_types': list(freeze_node_types or []),
     }
 
     if verbose:
@@ -198,6 +261,40 @@ def _ensure_node_features(data):
     return data
 
 
+def _apply_freeze_node_types(cm, offsets, type_boundaries, node_types,
+                             freeze_node_types=None, verbose=False):
+    """Force selected node types to remain singleton supernodes."""
+    if not freeze_node_types:
+        return cm
+
+    freeze = set(freeze_node_types)
+    node_types = list(node_types)
+    known = set(node_types)
+    unknown = sorted(freeze - known)
+    if unknown:
+        raise ValueError(
+            f"Unknown freeze_node_types={unknown}; available={node_types}")
+
+    cm = np.asarray(cm, dtype=np.int64).copy()
+    n_total = int(type_boundaries[-1])
+    n_frozen = 0
+    for i, nt in enumerate(node_types):
+        if nt not in freeze:
+            continue
+        start = int(offsets[nt])
+        end = int(type_boundaries[i])
+        cm[start:end] = np.arange(start, end, dtype=np.int64)
+        n_frozen += end - start
+
+    if verbose:
+        min_ratio = n_frozen / max(n_total, 1)
+        print(f"[HCGC] freeze_node_types={sorted(freeze)}  "
+              f"frozen={n_frozen:,}/{n_total:,} "
+              f"(minimum possible ratio {min_ratio:.3f}, "
+              f"{1.0 / max(min_ratio, 1e-9):.1f}x max)")
+    return cm
+
+
 def _detect_target_type(data, target_type):
     if target_type is not None:
         if target_type not in data.node_types:
@@ -230,7 +327,16 @@ def _detect_target_type(data, target_type):
 
 
 def _build_args(ratio, pretrain, pretrain_epochs,
-                mini_batch_size=512, num_neighbors=None):
+                pretrain_patience=5,
+                emb_method='gnn',
+                coarsen_l2_normalize=True,
+                relprop_hops=2,
+                relprop_outdim=128,
+                mini_batch_size=512, num_neighbors=None,
+                use_soft_labels=False,
+                pairwise_merge=False,
+                type_thresholds=False,
+                metapath_thresholds=False):
     """Build default args namespace for compress()."""
     return types.SimpleNamespace(
         # Coarsening
@@ -240,13 +346,18 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         max_acc_loss                = 0.1,
         use_fast_scale              = True,
         coarsen_pca_dim             = 0,
+        coarsen_l2_normalize        = coarsen_l2_normalize,
         # HCGC kernel params
         hcgc_inner_passes           = 2,
         hcgc_max_outer              = 10,
         hcgc_feat_var_scale         = 1.0,
         hcgc_feat_var_scale_by_type = None,
+        hcgc_feat_var_scale_by_src_med = None,
+        hcgc_auto_type_thresholds   = type_thresholds,
+        hcgc_auto_metapath_thresholds = metapath_thresholds,
         hcgc_skip_reassignment      = False,
         hcgc_window_size            = 20,
+        hcgc_merge_cap_per_leader   = 1 if pairwise_merge else 0,
         hcgc_target_comp_ratio      = 0.0,
         hcgc_num_levels             = 5,
         hub_anchor_percentile       = 0.0,
@@ -256,14 +367,16 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         num_levels                  = 5,
         # Pretrain / embedding
         use_emb_coarsen             = pretrain,
-        emb_method                  = 'gnn',
+        emb_method                  = emb_method,
         pretrain_epochs             = pretrain_epochs,
-        pretrain_patience           = 5,
+        pretrain_patience           = pretrain_patience,
         pretrain_hidden             = None,
         emb_mode                    = 'conv',
         fast_embed                  = False,
         fast_embed_hops             = 2,
         fast_embed_outdim           = 128,
+        relprop_hops                = relprop_hops,
+        relprop_outdim              = relprop_outdim,
         # GNN architecture
         hidden                      = 256,
         dropout                     = 0.5,
@@ -274,7 +387,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         epochs                      = 200,
         eval_every                  = 10,
         patience                    = 30,
-        use_soft_labels             = False,
+        use_soft_labels             = use_soft_labels,
         emb_temp                    = 1.0,
         # Graph size
         mini_batch_size             = mini_batch_size,

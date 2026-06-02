@@ -728,6 +728,125 @@ def fast_embed_hetero(data, n_hops=2, out_dim=128, device=None, rng_seed=42, ver
     return h
 
 
+@torch.no_grad()
+def relation_aware_fast_embed_hetero(data, n_hops=2, out_dim=128, device=None,
+                                     rng_seed=42, verbose=True):
+    """Training-free relation-aware heterogeneous feature propagation.
+
+    Unlike fast_embed_hetero(), this keeps relation identity in two cheap ways:
+      1. each node receives a typed in/out relation-degree signature before
+         projection, and
+      2. each edge type uses a deterministic sign sketch during propagation.
+
+    This is intentionally backprop-free; it is meant as an ablation between raw
+    features and full GNN-pretrained embeddings.
+    """
+    if device is None:
+        device = _cfg.DEVICE
+
+    t0 = time.time()
+    gen = torch.Generator(device='cpu')
+    gen.manual_seed(rng_seed)
+
+    node_types = list(data.node_types)
+    edge_types = list(data.edge_types)
+    sig_dim = max(1, 2 * len(edge_types))
+
+    rel_sig = {}
+    for nt in node_types:
+        rel_sig[nt] = torch.zeros(data[nt].num_nodes, sig_dim, dtype=torch.float32)
+
+    for k, et in enumerate(edge_types):
+        s_type, _, d_type = et
+        ei = data[et].edge_index.cpu()
+        if ei.numel() == 0:
+            continue
+        ones = torch.ones(ei.size(1), dtype=torch.float32)
+        rel_sig[s_type][:, 2 * k].scatter_add_(0, ei[0], ones)
+        rel_sig[d_type][:, 2 * k + 1].scatter_add_(0, ei[1], ones)
+
+    h0 = {}
+    h = {}
+    for nt in node_types:
+        n = data[nt].num_nodes
+        x_raw = getattr(data[nt], 'x', None)
+        if x_raw is not None and x_raw.numel() > 0:
+            x = x_raw.float().cpu()
+        else:
+            x = torch.zeros(n, 1)
+        sig = rel_sig[nt].log1p()
+        x_aug = torch.cat([x, sig], dim=1).to(device)
+        d = x_aug.size(1)
+        if d == out_dim:
+            proj = x_aug
+        elif d > out_dim:
+            P = torch.randn(d, out_dim, generator=gen, device=device) / (out_dim ** 0.5)
+            proj = x_aug @ P
+        else:
+            pad = torch.zeros(n, out_dim - d, device=device)
+            proj = torch.cat([x_aug, pad], dim=1)
+        h0[nt] = F.normalize(proj, p=2, dim=1)
+        h[nt] = h0[nt]
+
+    if verbose:
+        print(f"  [RelProp] out_dim={out_dim}  hops={n_hops}  rel_sig_dim={sig_dim}")
+
+    adjs = []
+    for rid, et in enumerate(edge_types):
+        s_type, _, d_type = et
+        ei = data[et].edge_index.to(device)
+        if ei.size(1) == 0:
+            continue
+
+        def _make_adj(src_type, dst_type, src_idx, dst_idx):
+            n_src = data[src_type].num_nodes
+            n_dst = data[dst_type].num_nodes
+            deg = torch.zeros(n_dst, device=device)
+            deg.scatter_add_(0, dst_idx, torch.ones(dst_idx.size(0), device=device))
+            val = (1.0 / deg[dst_idx].clamp(min=1.0)).float()
+            return torch.sparse_coo_tensor(
+                torch.stack([dst_idx, src_idx]), val, (n_dst, n_src), device=device
+            ).coalesce()
+
+        fwd = _make_adj(s_type, d_type, ei[0], ei[1])
+        rev = _make_adj(d_type, s_type, ei[1], ei[0])
+
+        sign_gen = torch.Generator(device='cpu')
+        sign_gen.manual_seed(rng_seed + 1009 * (rid + 1))
+        sign = torch.randint(0, 2, (out_dim,), generator=sign_gen, dtype=torch.float32)
+        sign = (sign * 2.0 - 1.0).to(device)
+
+        adjs.append((s_type, d_type, fwd, sign))
+        adjs.append((d_type, s_type, rev, sign))
+
+    for hop in range(n_hops):
+        agg_sum = {nt: torch.zeros_like(h[nt]) for nt in node_types}
+        agg_count = {nt: 0 for nt in node_types}
+
+        for s_type, d_type, adj, sign in adjs:
+            msg = torch.sparse.mm(adj, h[s_type])
+            agg_sum[d_type] = agg_sum[d_type] + msg * sign
+            agg_count[d_type] += 1
+
+        h_new = {}
+        for nt in node_types:
+            if agg_count[nt] > 0:
+                scale = max(1.0, agg_count[nt] ** 0.5)
+                h_new[nt] = F.normalize(h0[nt] + agg_sum[nt] / scale, p=2, dim=1)
+            else:
+                h_new[nt] = h[nt]
+        h = h_new
+
+        if verbose:
+            print(f"  [RelProp] hop {hop+1}/{n_hops}  ({time.time()-t0:.1f}s)")
+
+    if verbose:
+        print(f"  [RelProp] Done  {time.time()-t0:.1f}s  "
+              + "  ".join(f"{nt}:{h[nt].shape}" for nt in node_types))
+
+    return {nt: h[nt].cpu() for nt in node_types}
+
+
 def extract_emb_flat_arrays(emb_dict, l2_normalize=True):
     """Flatten embedding dict to a contiguous float32 array for the C++ core."""
     feats_list, feat_dims = [], []

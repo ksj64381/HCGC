@@ -39,7 +39,11 @@ from benchmark import (
 
 def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
               pretrain=True, train_epochs=200, train_hidden=256,
-              mini_batch_size=512, model_name='sage', baseline=True):
+              mini_batch_size=512, model_name='sage', baseline=True,
+              emb_method='gnn', coarsen_l2_normalize=True,
+              relprop_hops=2, relprop_outdim=128,
+              type_thresholds=False, metapath_thresholds=False,
+              edge_weight_mode='binary'):
     """Run compress→train for each ratio and return collected stats.
 
     Returns
@@ -55,6 +59,11 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     print(f"  ratios   : {ratios}")
     print(f"  model    : {model_name}")
     print(f"  pretrain : {pretrain}")
+    print(f"  emb      : {emb_method if pretrain else 'raw'}")
+    print(f"  edge_w   : {edge_weight_mode}")
+    _thresh_mode = ('metapath-auto' if metapath_thresholds
+                    else 'type-auto' if type_thresholds else 'global')
+    print(f"  thresh   : {_thresh_mode}")
     print(f"  device   : {device}")
     print(f"  runs     : {warmup} warmup  +  {runs} timed")
     print(f"{'='*W}\n")
@@ -102,13 +111,26 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
                      pretrain=False, verbose=False,
-                     mini_batch_size=mini_batch_size, model_name=model_name)
+                     mini_batch_size=mini_batch_size, model_name=model_name,
+                     coarsen_l2_normalize=coarsen_l2_normalize,
+                     relprop_hops=relprop_hops,
+                     relprop_outdim=relprop_outdim,
+                     type_thresholds=type_thresholds,
+                     metapath_thresholds=metapath_thresholds,
+                     edge_weight_mode=edge_weight_mode)
             print(f"  warmup {i+1}/{warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
                      pretrain=pretrain, verbose=False,
                      train_epochs=train_epochs, train_hidden=train_hidden,
-                     mini_batch_size=mini_batch_size, model_name=model_name)
+                     mini_batch_size=mini_batch_size, model_name=model_name,
+                     emb_method=emb_method,
+                     coarsen_l2_normalize=coarsen_l2_normalize,
+                     relprop_hops=relprop_hops,
+                     relprop_outdim=relprop_outdim,
+                     type_thresholds=type_thresholds,
+                     metapath_thresholds=metapath_thresholds,
+                     edge_weight_mode=edge_weight_mode)
             print(f"  warmup {i+1}/{warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Ratio sweep ───────────────────────────────────────────────────────────
@@ -128,6 +150,13 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                 verbose         = False,
                 mini_batch_size = mini_batch_size,
                 model_name      = model_name,
+                emb_method      = emb_method,
+                coarsen_l2_normalize = coarsen_l2_normalize,
+                relprop_hops    = relprop_hops,
+                relprop_outdim  = relprop_outdim,
+                type_thresholds = type_thresholds,
+                metapath_thresholds = metapath_thresholds,
+                edge_weight_mode = edge_weight_mode,
             )
             recs.append(r)
             print(f"comp={r['compression']:.2f}x  "
@@ -226,6 +255,20 @@ def main():
     parser.add_argument('--root',     default='data',
                         help='Dataset download root')
     parser.add_argument('--no-pretrain', action='store_true')
+    parser.add_argument('--emb-method', default='gnn',
+                        choices=['gnn', 'fast', 'relprop', 'metapath2vec'])
+    parser.add_argument('--raw-no-l2', action='store_true',
+                        help='Disable row-wise L2 normalization for raw-feature coarsening.')
+    parser.add_argument('--relprop-hops', type=int, default=2)
+    parser.add_argument('--relprop-outdim', type=int, default=128)
+    parser.add_argument('--type-thresholds', action='store_true',
+                        help='Use auto-calibrated per-source-type thresholds.')
+    parser.add_argument('--metapath-thresholds', action='store_true',
+                        help='Use auto-calibrated per-(source type, mediator type) '
+                             'thresholds. Takes precedence over --type-thresholds.')
+    parser.add_argument('--edge-weight-mode', default='binary',
+                        choices=['binary', 'count', 'log_count', 'density'],
+                        help='Compressed super-edge weighting mode.')
     parser.add_argument('--train-epochs', type=int, default=200)
     parser.add_argument('--train-hidden', type=int, default=256)
     parser.add_argument('--mini-batch-size', type=int, default=512)
@@ -259,6 +302,13 @@ def main():
             mini_batch_size = args.mini_batch_size,
             model_name      = models[0],
             baseline        = do_base,
+            emb_method      = args.emb_method,
+            coarsen_l2_normalize = not args.raw_no_l2,
+            relprop_hops    = args.relprop_hops,
+            relprop_outdim  = args.relprop_outdim,
+            type_thresholds = args.type_thresholds,
+            metapath_thresholds = args.metapath_thresholds,
+            edge_weight_mode = args.edge_weight_mode,
         )
         print_sweep_table(base_stats, sweep, args.dataset)
 
@@ -285,6 +335,13 @@ def main():
                 mini_batch_size = args.mini_batch_size,
                 model_name      = mname,
                 baseline        = do_base,
+                emb_method      = args.emb_method,
+                coarsen_l2_normalize = not args.raw_no_l2,
+                relprop_hops    = args.relprop_hops,
+                relprop_outdim  = args.relprop_outdim,
+                type_thresholds = args.type_thresholds,
+                metapath_thresholds = args.metapath_thresholds,
+                edge_weight_mode = args.edge_weight_mode,
             )
             print_sweep_table(base_stats, sweep, args.dataset)
             all_results[mname] = (base_stats, sweep)

@@ -13,7 +13,7 @@ from hcgc._model import (
     build_model, _train_auto, _extract_emb_auto, _is_large_graph,
     extract_metapath2vec_embeddings, extract_emb_flat_arrays,
     eval_compressed_on_original, MINI_BATCH_THRESHOLD,
-    train_full_batch, fast_embed_hetero,
+    train_full_batch, fast_embed_hetero, relation_aware_fast_embed_hetero,
 )
 from hcgc._coarsen import (
     extract_flat_arrays, build_compressed_data,
@@ -125,7 +125,10 @@ def _load_and_pretrain(data, args):
     Returns a context dict reusable across multiple coarsening runs.
     """
     src_nodes, dst_nodes, weights, all_features, type_boundaries, feature_dims, offsets = \
-        extract_flat_arrays(data)
+        extract_flat_arrays(
+            data,
+            l2_normalize=getattr(args, 'coarsen_l2_normalize', True),
+        )
 
     emb_dict = None
     coarsen_features, coarsen_feat_dims = all_features, feature_dims
@@ -153,6 +156,17 @@ def _load_and_pretrain(data, args):
             print("="*60)
             emb_dict = fast_embed_hetero(
                 data, n_hops=fe_hops, out_dim=fe_outdim,
+                device=_cfg.DEVICE, verbose=True)
+
+        elif emb_method in ('relprop', 'relation'):
+            rp_hops   = getattr(args, 'relprop_hops',   2)
+            rp_outdim = getattr(args, 'relprop_outdim', 128)
+            print("\n" + "="*60)
+            print(f"  RELATION-AWARE PROPAGATION  "
+                  f"(training-free, hops={rp_hops}, out_dim={rp_outdim})")
+            print("="*60)
+            emb_dict = relation_aware_fast_embed_hetero(
+                data, n_hops=rp_hops, out_dim=rp_outdim,
                 device=_cfg.DEVICE, verbose=True)
 
         else:

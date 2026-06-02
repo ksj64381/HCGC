@@ -27,7 +27,7 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import HeteroConv, SAGEConv
+from torch_geometric.nn import HeteroConv, SAGEConv, MessagePassing
 
 try:
     from tqdm import tqdm as _tqdm
@@ -625,6 +625,67 @@ class _HeteroSAGE(torch.nn.Module):
         return self.clf(h[target_type])
 
 
+class _WeightedSAGEConv(MessagePassing):
+    """GraphSAGE-style weighted neighbour mean for quotient graphs."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__(aggr='add')
+        self.lin_neigh = torch.nn.Linear(in_channels, out_channels)
+        self.lin_root = torch.nn.Linear(in_channels, out_channels)
+
+    def forward(self, x, edge_index, edge_weight=None, size=None):
+        if isinstance(x, tuple):
+            x_src, x_dst = x
+        else:
+            x_src = x_dst = x
+        if edge_weight is None:
+            edge_weight = x_src.new_ones(edge_index.size(1))
+        edge_weight = edge_weight.to(dtype=x_src.dtype, device=x_src.device)
+        out = self.propagate(edge_index, x=x_src, edge_weight=edge_weight,
+                             size=(x_src.size(0), x_dst.size(0)))
+        dst = edge_index[1]
+        denom = x_src.new_zeros(x_dst.size(0))
+        denom.scatter_add_(0, dst, edge_weight)
+        out = out / denom.clamp(min=1.0).unsqueeze(-1)
+        return self.lin_neigh(out) + self.lin_root(x_dst)
+
+    def message(self, x_j, edge_weight):
+        return x_j * edge_weight.view(-1, 1)
+
+
+class _WeightedHeteroSAGE(torch.nn.Module):
+    """Heterogeneous GraphSAGE that consumes per-relation edge_weight."""
+
+    def __init__(self, edge_types, feat_dims, hidden, num_classes, dropout=0.5,
+                 num_layers=2):
+        super().__init__()
+        self.proj = torch.nn.ModuleDict({
+            nt.replace('.', '_'): torch.nn.Linear(d, hidden)
+            for nt, d in feat_dims.items()
+        })
+
+        def _conv():
+            return HeteroConv(
+                {et: _WeightedSAGEConv(hidden, hidden) for et in edge_types},
+                aggr='mean')
+
+        self.convs = torch.nn.ModuleList([_conv() for _ in range(num_layers)])
+        self.clf   = torch.nn.Linear(hidden, num_classes)
+        self.drop  = torch.nn.Dropout(dropout)
+        self.num_layers = num_layers
+
+    def forward(self, x_dict, edge_index_dict, target_type, edge_weight_dict=None):
+        h = {nt: F.relu(self.proj[nt.replace('.', '_')](x))
+             for nt, x in x_dict.items()
+             if nt.replace('.', '_') in self.proj}
+        edge_weight_dict = edge_weight_dict or {}
+        for i, conv in enumerate(self.convs):
+            h = conv(h, edge_index_dict, edge_weight_dict=edge_weight_dict)
+            if i < self.num_layers - 1:
+                h = {k: F.relu(self.drop(v)) for k, v in h.items() if v is not None}
+        return self.clf(h[target_type])
+
+
 class _DownstreamHGT(torch.nn.Module):
     """Heterogeneous Graph Transformer (Hu et al., WWW 2020).
 
@@ -737,8 +798,16 @@ class _DownstreamRGCN(torch.nn.Module):
 _DOWNSTREAM_MODELS = ('sage', 'hgt', 'gat', 'rgcn')
 
 
+def _edge_weight_dict(data):
+    weights = {}
+    for et in data.edge_types:
+        if hasattr(data[et], 'edge_weight'):
+            weights[et] = data[et].edge_weight
+    return weights or None
+
+
 def _build_downstream_model(data, target_type, model_name, hidden, num_classes,
-                             dropout=0.5, dev=None):
+                             dropout=0.5, dev=None, use_edge_weights=False):
     """Factory: instantiate a downstream GNN by name and move to device."""
     model_name = model_name.lower()
     if model_name == 'hgt':
@@ -751,7 +820,11 @@ def _build_downstream_model(data, target_type, model_name, hidden, num_classes,
         feat_dims = {nt: data[nt].x.shape[1]
                      for nt in data.node_types
                      if hasattr(data[nt], 'x') and data[nt].x is not None}
-        m = _HeteroSAGE(data.edge_types, feat_dims, hidden, num_classes, dropout)
+        if use_edge_weights:
+            m = _WeightedHeteroSAGE(
+                data.edge_types, feat_dims, hidden, num_classes, dropout)
+        else:
+            m = _HeteroSAGE(data.edge_types, feat_dims, hidden, num_classes, dropout)
     return m if dev is None else m.to(dev)
 
 
@@ -816,7 +889,9 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                                   epochs=200, lr=1e-3, patience=None,
                                   hidden=256, batch_size=512,
                                   model_name='sage',
-                                  orig_data=None, node_map=None):
+                                  orig_data=None, node_map=None,
+                                  use_soft_labels=False,
+                                  use_edge_weights=False):
     """Mini-batch HeteroSAGE training via NeighborLoader.
 
     Used automatically by train_on_heterodata when the graph has more than
@@ -873,8 +948,10 @@ def _train_mini_batch_downstream(data, target_type, device_str,
 
     num_classes = int(data[target_type].y.max().item()) + 1
     model = _build_downstream_model(data, target_type, model_name,
-                                    hidden, num_classes, dev=dev)
-    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+                                    hidden, num_classes, dev=dev,
+                                    use_edge_weights=use_edge_weights)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     # Per-edge-type neighbor counts: {et: [hop1, hop2]}.
     # Dense hetero graphs (e.g. ogbn-mag 7 edge types) blow up quickly with
@@ -895,6 +972,11 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     _n_val_pre = data[target_type].val_mask.sum().item()
     if _n_val_pre < 5 and orig_data is not None:
         _resplit_supernodes(data, target_type, orig_data)
+
+    soft_y = None
+    if use_soft_labels and hasattr(data[target_type], 'soft_y'):
+        soft_y = data[target_type].soft_y
+        print("  [train] Soft-label cross-entropy ON (mini-batch)")
 
     train_loader = NeighborLoader(
         data,
@@ -926,7 +1008,9 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         with torch.no_grad():
             for batch in loader:
                 batch = batch.to(dev)
-                out   = model(batch.x_dict, batch.edge_index_dict, target_type)
+                out   = model(batch.x_dict, batch.edge_index_dict, target_type,
+                              _edge_weight_dict(batch)) if use_edge_weights else \
+                        model(batch.x_dict, batch.edge_index_dict, target_type)
                 n     = batch[target_type].batch_size
                 pred  = out[:n].argmax(dim=1)
                 lbl   = batch[target_type].y[:n]
@@ -968,15 +1052,23 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         n_batches  = 0
         for batch in train_loader:
             batch = batch.to(dev)
-            out   = model(batch.x_dict, batch.edge_index_dict, target_type)
+            out   = model(batch.x_dict, batch.edge_index_dict, target_type,
+                          _edge_weight_dict(batch)) if use_edge_weights else \
+                    model(batch.x_dict, batch.edge_index_dict, target_type)
             n     = batch[target_type].batch_size
-            loss  = F.cross_entropy(out[:n], batch[target_type].y[:n],
-                                    ignore_index=-1)
+            if soft_y is not None:
+                b_nids = batch[target_type].n_id[:n].cpu()
+                b_soft = soft_y[b_nids].to(dev)
+                loss = -(b_soft * F.log_softmax(out[:n], dim=1)).sum(1).mean()
+            else:
+                loss = F.cross_entropy(out[:n], batch[target_type].y[:n],
+                                       ignore_index=-1)
             opt.zero_grad()
             loss.backward()
             opt.step()
             total_loss += loss.item()
             n_batches  += 1
+        sched.step()
         last_loss = total_loss / max(n_batches, 1)
 
         if ep % eval_every == 0:
@@ -1029,7 +1121,9 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         with torch.no_grad():
             for batch in inf_loader:
                 batch = batch.to(dev)
-                out   = model(batch.x_dict, batch.edge_index_dict, target_type)
+                out   = model(batch.x_dict, batch.edge_index_dict, target_type,
+                              _edge_weight_dict(batch)) if use_edge_weights else \
+                        model(batch.x_dict, batch.edge_index_dict, target_type)
                 bs    = batch[target_type].batch_size
                 pred  = out[:bs].argmax(1).cpu()
                 nids  = batch[target_type].n_id[:bs].cpu()
@@ -1048,7 +1142,9 @@ def train_on_heterodata(data, target_type, device_str,
                         epochs=200, lr=1e-3, patience=None, hidden=256,
                         mini_batch_size=512, model_name='sage',
                         orig_data=None, node_map=None,
-                        force_full_batch=False):
+                        force_full_batch=False,
+                        use_soft_labels=False,
+                        use_edge_weights=False):
     """Train a 2-layer HeteroSAGE on any HeteroData object.
 
     Automatically switches to mini-batch (NeighborLoader) mode when the
@@ -1075,6 +1171,8 @@ def train_on_heterodata(data, target_type, device_str,
             batch_size=mini_batch_size,
             model_name=model_name,
             orig_data=orig_data, node_map=node_map,
+            use_soft_labels=use_soft_labels,
+            use_edge_weights=use_edge_weights,
         )
 
     dev = torch.device(
@@ -1091,8 +1189,15 @@ def train_on_heterodata(data, target_type, device_str,
 
     num_classes = int(cdata[target_type].y.max().item()) + 1
     model = _build_downstream_model(cdata, target_type, model_name,
-                                    hidden, num_classes, dev=dev)
-    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+                                    hidden, num_classes, dev=dev,
+                                    use_edge_weights=use_edge_weights)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    soft_y = None
+    if use_soft_labels and hasattr(cdata[target_type], 'soft_y'):
+        soft_y = cdata[target_type].soft_y
+        print("  [train] Soft-label cross-entropy ON")
 
     best_val, best_test = 0.0, 0.0
     best_state          = None
@@ -1117,20 +1222,29 @@ def train_on_heterodata(data, target_type, device_str,
 
     ep_bar = _tqdm(range(1, epochs + 1), desc='  train', unit='ep',
                    ncols=88, leave=True)
+    edge_weight_dict = _edge_weight_dict(cdata) if use_edge_weights else None
     for ep in ep_bar:
         model.train()
         opt.zero_grad()
-        out  = model(cdata.x_dict, cdata.edge_index_dict, target_type)
+        out  = model(cdata.x_dict, cdata.edge_index_dict, target_type,
+                     edge_weight_dict) if use_edge_weights else \
+               model(cdata.x_dict, cdata.edge_index_dict, target_type)
         mask = cdata[target_type].train_mask
-        loss = F.cross_entropy(out[mask], cdata[target_type].y[mask],
-                               ignore_index=-1)
+        if soft_y is not None:
+            loss = -(soft_y[mask] * F.log_softmax(out[mask], dim=1)).sum(1).mean()
+        else:
+            loss = F.cross_entropy(out[mask], cdata[target_type].y[mask],
+                                   ignore_index=-1)
         loss.backward()
         opt.step()
+        sched.step()
 
         if ep % eval_every == 0:
             model.eval()
             with torch.no_grad():
-                out = model(cdata.x_dict, cdata.edge_index_dict, target_type)
+                out = model(cdata.x_dict, cdata.edge_index_dict, target_type,
+                            edge_weight_dict) if use_edge_weights else \
+                      model(cdata.x_dict, cdata.edge_index_dict, target_type)
             pred = out.argmax(dim=1)
             y    = cdata[target_type].y
 
@@ -1139,8 +1253,24 @@ def train_on_heterodata(data, target_type, device_str,
                 if idx.sum() == 0:
                     return 0.0
                 return (pred[idx] == y[idx]).float().mean().item()
-            val_acc  = _masked_acc(cdata[target_type].val_mask)
-            test_acc = _masked_acc(cdata[target_type].test_mask)
+
+            if orig_data is not None and node_map is not None and target_type in node_map:
+                nm = node_map[target_type].to(dev)
+
+                def _orig_mapped_acc(mask_name):
+                    o_mask = getattr(orig_data[target_type], mask_name)
+                    if not o_mask.any():
+                        return 0.0
+                    o_mask_dev = o_mask.to(dev)
+                    super_idx = nm[o_mask_dev]
+                    y_orig = orig_data[target_type].y[o_mask].to(dev)
+                    return (pred[super_idx] == y_orig).float().mean().item()
+
+                val_acc  = _orig_mapped_acc('val_mask')
+                test_acc = _orig_mapped_acc('test_mask')
+            else:
+                val_acc  = _masked_acc(cdata[target_type].val_mask)
+                test_acc = _masked_acc(cdata[target_type].test_mask)
 
             if val_acc > best_val:
                 best_val, best_test, no_improve = val_acc, test_acc, 0
@@ -1175,7 +1305,9 @@ def train_on_heterodata(data, target_type, device_str,
     if orig_data is not None and node_map is not None and target_type in node_map:
         model.eval()
         with torch.no_grad():
-            out = model(cdata.x_dict, cdata.edge_index_dict, target_type)
+            out = model(cdata.x_dict, cdata.edge_index_dict, target_type,
+                        edge_weight_dict) if use_edge_weights else \
+                  model(cdata.x_dict, cdata.edge_index_dict, target_type)
         nm        = node_map[target_type]            # [n_orig_target] -> supernode index
         te_mask   = orig_data[target_type].test_mask
         y_orig    = orig_data[target_type].y[te_mask]
@@ -1190,22 +1322,76 @@ def train_on_heterodata(data, target_type, device_str,
 def train_downstream(result, orig_data, target_type, device_str,
                      epochs=200, lr=1e-3, patience=None, hidden=256,
                      mini_batch_size=512, model_name='sage',
-                     force_full_batch=False):
-    """Train on a compressed HCGCResult; evaluate on original test-node labels.
+                     force_full_batch=False,
+                     eval_protocol='original',
+                     use_soft_labels=False,
+                     use_edge_weights=False):
+    """Train on a compressed HCGCResult.
 
-    Passes orig_data + result.node_map so the final accuracy is computed by
-    mapping supernode predictions back to original node labels (the correct
-    protocol for a coarsening benchmark).
+    eval_protocol='original' maps predictions back to original test-node labels
+    (the correct protocol for a coarsening benchmark). eval_protocol='supernode'
+    reproduces the older majority-vote supernode-label evaluation.
 
     patience=None (default): run all epochs without early stopping. Compressed
     supernode labels are noisy majority votes, making early stopping unreliable.
     """
+    eval_orig = orig_data if eval_protocol == 'original' else None
+    eval_map = result.node_map if eval_protocol == 'original' else None
     return train_on_heterodata(result.data, target_type, device_str,
                                epochs=epochs, lr=lr, patience=patience,
                                hidden=hidden, mini_batch_size=mini_batch_size,
                                model_name=model_name,
-                               orig_data=orig_data, node_map=result.node_map,
-                               force_full_batch=force_full_batch)
+                               orig_data=eval_orig, node_map=eval_map,
+                               force_full_batch=force_full_batch,
+                               use_soft_labels=use_soft_labels,
+                               use_edge_weights=use_edge_weights)
+
+
+def oracle_upper_bound(result, orig_data, target_type, mask_name='test_mask'):
+    """Label-majority upper bound induced by the target-node compression map."""
+    empty = {
+        'oracle_acc': float('nan'),
+        'oracle_n_nodes': 0,
+        'oracle_n_supernodes': 0,
+        'oracle_mixed_frac': float('nan'),
+        'oracle_mean_purity': float('nan'),
+    }
+    if target_type not in result.node_map:
+        return empty
+
+    node_store = orig_data[target_type]
+    mask = getattr(node_store, mask_name, None)
+    if mask is None or not hasattr(node_store, 'y'):
+        return empty
+
+    y = node_store.y.detach().cpu()
+    mask = mask.detach().cpu().bool()
+    valid = mask & (y >= 0)
+    n_valid = int(valid.sum().item())
+    if n_valid == 0:
+        return empty
+
+    super_idx = result.node_map[target_type].detach().cpu()[valid].long()
+    labels = y[valid].long()
+    n_cls = int(y[y >= 0].max().item()) + 1
+    unique_super, inv = torch.unique(super_idx, return_inverse=True)
+
+    counts = torch.zeros(len(unique_super), n_cls, dtype=torch.long)
+    one_hot = torch.zeros(n_valid, n_cls, dtype=torch.long)
+    one_hot.scatter_(1, labels.unsqueeze(1), 1)
+    counts.scatter_add_(0, inv.unsqueeze(1).expand(-1, n_cls), one_hot)
+
+    per_super_total = counts.sum(dim=1).clamp(min=1)
+    per_super_best = counts.max(dim=1).values
+    classes_per_super = (counts > 0).sum(dim=1)
+
+    return {
+        'oracle_acc': float(per_super_best.sum().item() / n_valid),
+        'oracle_n_nodes': n_valid,
+        'oracle_n_supernodes': int(len(unique_super)),
+        'oracle_mixed_frac': float((classes_per_super > 1).float().mean().item()),
+        'oracle_mean_purity': float((per_super_best.float() / per_super_total.float()).mean().item()),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1231,7 +1417,13 @@ def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
 def run_once(data, target_type, ratio, device, pretrain,
              train_epochs=200, train_hidden=256, verbose=False,
              mini_batch_size=512, model_name='sage', force_full_batch=False,
-             train_patience=None):
+             train_patience=None, emb_method='gnn',
+             coarsen_l2_normalize=True, relprop_hops=2, relprop_outdim=128,
+             pretrain_epochs=100, pretrain_patience=5,
+             use_soft_labels=False, eval_protocol='original',
+             pairwise_merge=False, type_thresholds=False,
+             metapath_thresholds=False, edge_weight_mode='binary',
+             freeze_node_types=None):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
@@ -1246,15 +1438,29 @@ def run_once(data, target_type, ratio, device, pretrain,
             ratio           = ratio,
             target_type     = target_type,
             pretrain        = pretrain,
+            pretrain_epochs = pretrain_epochs,
+            pretrain_patience = pretrain_patience,
+            emb_method      = emb_method,
+            coarsen_l2_normalize = coarsen_l2_normalize,
+            relprop_hops    = relprop_hops,
+            relprop_outdim  = relprop_outdim,
             device          = device,
             verbose         = verbose,
             mini_batch_size = mini_batch_size,
+            use_soft_labels = use_soft_labels,
+            pairwise_merge  = pairwise_merge,
+            type_thresholds = type_thresholds,
+            metapath_thresholds = metapath_thresholds,
+            edge_weight_mode = edge_weight_mode,
+            freeze_node_types = freeze_node_types,
         )
     t_compress = time.perf_counter() - t0
+    oracle = oracle_upper_bound(result, data, target_type, 'test_mask')
+    oracle_val = oracle_upper_bound(result, data, target_type, 'val_mask')
 
     # ── Downstream training ───────────────────────────────────────────────────
-    # Pass orig_data so train_downstream evaluates on original node labels,
-    # not supernode majority-vote labels.
+    # Default evaluation maps predictions back to original node labels; the
+    # legacy supernode protocol is available through --eval-protocol supernode.
     test_acc, t_train = train_downstream(
         result, data, target_type,
         device_str       = device,
@@ -1264,6 +1470,9 @@ def run_once(data, target_type, ratio, device, pretrain,
         model_name       = model_name,
         force_full_batch = force_full_batch,
         patience         = train_patience,
+        eval_protocol    = eval_protocol,
+        use_soft_labels  = use_soft_labels,
+        use_edge_weights = str(edge_weight_mode or 'binary').lower() != 'binary',
     )
 
     n_orig = result.info['n_nodes_orig']
@@ -1280,6 +1489,13 @@ def run_once(data, target_type, ratio, device, pretrain,
         't_train':      t_train,
         't_total':      t_compress + t_train,
         'test_acc':     test_acc,
+        'oracle_acc':   oracle['oracle_acc'],
+        'oracle_val_acc': oracle_val['oracle_acc'],
+        'oracle_gap':   oracle['oracle_acc'] - test_acc,
+        'oracle_n_nodes': oracle['oracle_n_nodes'],
+        'oracle_n_supernodes': oracle['oracle_n_supernodes'],
+        'oracle_mixed_frac': oracle['oracle_mixed_frac'],
+        'oracle_mean_purity': oracle['oracle_mean_purity'],
         'n_nodes_orig': n_orig,
         'n_nodes_comp': n_comp,
         'edges_orig':   e_orig,
@@ -1314,6 +1530,23 @@ def main():
                         help='Dataset download root')
     parser.add_argument('--no-pretrain', action='store_true',
                         help='Skip GNN pretrain (faster, slightly lower quality)')
+    parser.add_argument('--emb-method', default='gnn',
+                        choices=['gnn', 'fast', 'relprop', 'metapath2vec'],
+                        help="Coarsening representation when pretrain is enabled. "
+                             "'relprop' is training-free relation-aware propagation.")
+    parser.add_argument('--raw-no-l2', action='store_true',
+                        help='For --no-pretrain raw-feature coarsening, disable row-wise '
+                             'L2 normalization before the C++ kernel.')
+    parser.add_argument('--relprop-hops', type=int, default=2,
+                        help='Propagation hops for --emb-method relprop')
+    parser.add_argument('--relprop-outdim', type=int, default=128,
+                        help='Output dimension for --emb-method relprop')
+    parser.add_argument('--pretrain-epochs', type=int, default=100,
+                        help='Max epochs for GNN pretraining before coarsening')
+    parser.add_argument('--pretrain-patience', type=int, default=5,
+                        help='Early-stopping patience for GNN pretraining. '
+                             'Eval is every 10 epochs, so values below 10 stop '
+                             'after one non-improving eval.')
     parser.add_argument('--train-epochs', type=int, default=200,
                         help='Downstream training epochs per run')
     parser.add_argument('--train-hidden', type=int, default=256,
@@ -1332,6 +1565,36 @@ def main():
                              'Default None = run all --train-epochs without early stopping '
                              '(recommended for compressed graphs with noisy supernode labels). '
                              'Use e.g. --train-patience 50 to re-enable early stopping.')
+    parser.add_argument('--soft-labels', action='store_true',
+                        help='Train compressed supernodes with class-proportion soft labels '
+                             'instead of hard majority-vote labels.')
+    parser.add_argument('--pairwise-merge', action='store_true',
+                        help='CGC-like ablation: each density leader merges only the '
+                             'single cheapest eligible neighbour under marginal join '
+                             'cost instead of absorbing all neighbours inside the '
+                             'Ball Multi-Merge radius.')
+    parser.add_argument('--type-thresholds', action='store_true',
+                        help='Estimate per-source-type threshold bases from '
+                             'mediator-pair energy samples, then search one global '
+                             'multiplier for target compression.')
+    parser.add_argument('--metapath-thresholds', action='store_true',
+                        help='Estimate per-(source type, mediator type) threshold '
+                             'bases from mediator-pair energy samples. Takes '
+                             'precedence over --type-thresholds.')
+    parser.add_argument('--edge-weight-mode', default='binary',
+                        choices=['binary', 'count', 'log_count', 'density'],
+                        help='Compressed super-edge weighting. binary keeps the '
+                             'current deduplicated quotient graph; count/log_count/'
+                             'density preserve collapsed edge multiplicity and use '
+                             'a weighted SAGE aggregator.')
+    parser.add_argument('--freeze-node-types', nargs='*', default=[],
+                        help='Node types to keep as singleton supernodes, e.g. '
+                             '--freeze-node-types author for target-freeze ablation.')
+    parser.add_argument('--eval-protocol', choices=['original', 'supernode'],
+                        default='original',
+                        help="'original' maps supernode predictions back to original test "
+                             "nodes. 'supernode' reproduces the older optimistic benchmark "
+                             "that evaluates majority-vote supernode labels.")
     parser.add_argument('--baseline', action='store_true',
                         help='Also train on the original graph and print speedup comparison')
     args = parser.parse_args()
@@ -1347,6 +1610,19 @@ def main():
     print(f"  ratio    : {args.ratio}  ({1/args.ratio:.1f}x target compression)")
     print(f"  model    : {args.model}")
     print(f"  pretrain : {pretrain}")
+    print(f"  emb      : {args.emb_method if pretrain else 'raw'}")
+    if pretrain:
+        print(f"  pretrain epochs/patience : {args.pretrain_epochs}/{args.pretrain_patience}")
+    if not pretrain:
+        print(f"  raw_l2   : {not args.raw_no_l2}")
+    print(f"  soft_y   : {args.soft_labels}")
+    print(f"  edge_w   : {args.edge_weight_mode}")
+    print(f"  freeze   : {args.freeze_node_types or 'none'}")
+    print(f"  merge    : {'pairwise' if args.pairwise_merge else 'ball-multi'}")
+    _thresh_mode = ('metapath-auto' if args.metapath_thresholds
+                    else 'type-auto' if args.type_thresholds else 'global')
+    print(f"  thresh   : {_thresh_mode}")
+    print(f"  eval     : {args.eval_protocol}")
     print(f"  device   : {args.device}")
     print(f"  runs     : {args.warmup} warmup  +  {args.runs} timed")
     print(f"{'='*W}\n")
@@ -1399,7 +1675,19 @@ def main():
                      pretrain=False, verbose=False,
                      mini_batch_size=args.mini_batch_size,
                      model_name=args.model,
-                     force_full_batch=args.force_full_batch)
+                     force_full_batch=args.force_full_batch,
+                     pretrain_epochs=args.pretrain_epochs,
+                     pretrain_patience=args.pretrain_patience,
+                     use_soft_labels=args.soft_labels,
+                     pairwise_merge=args.pairwise_merge,
+                     type_thresholds=args.type_thresholds,
+                     metapath_thresholds=args.metapath_thresholds,
+                     edge_weight_mode=args.edge_weight_mode,
+                     eval_protocol=args.eval_protocol,
+                     coarsen_l2_normalize=not args.raw_no_l2,
+                     relprop_hops=args.relprop_hops,
+                     relprop_outdim=args.relprop_outdim,
+                     freeze_node_types=args.freeze_node_types)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
@@ -1408,8 +1696,23 @@ def main():
                      pretrain=pretrain, verbose=False,
                      mini_batch_size=args.mini_batch_size,
                      model_name=args.model,
-                     force_full_batch=args.force_full_batch)
-            print(f"  warmup {i+1}/{args.warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
+                     force_full_batch=args.force_full_batch,
+                     emb_method=args.emb_method,
+                     pretrain_epochs=args.pretrain_epochs,
+                     pretrain_patience=args.pretrain_patience,
+                     use_soft_labels=args.soft_labels,
+                     pairwise_merge=args.pairwise_merge,
+                     type_thresholds=args.type_thresholds,
+                     metapath_thresholds=args.metapath_thresholds,
+                     edge_weight_mode=args.edge_weight_mode,
+                     eval_protocol=args.eval_protocol,
+                     coarsen_l2_normalize=not args.raw_no_l2,
+                     relprop_hops=args.relprop_hops,
+                     relprop_outdim=args.relprop_outdim,
+                     freeze_node_types=args.freeze_node_types)
+            print(f"  warmup {i+1}/{args.warmup} "
+                  f"[pretrain={pretrain}, emb={args.emb_method if pretrain else 'raw'}]  "
+                  f"({time.perf_counter()-t_wu:.1f}s)")
 
     # ── Timed runs ────────────────────────────────────────────────────────────
     print(f"\nTimed runs ({args.runs}) ...")
@@ -1428,19 +1731,33 @@ def main():
             model_name       = args.model,
             force_full_batch = args.force_full_batch,
             train_patience   = args.train_patience,
+            emb_method       = args.emb_method,
+            pretrain_epochs  = args.pretrain_epochs,
+            pretrain_patience = args.pretrain_patience,
+            use_soft_labels  = args.soft_labels,
+            pairwise_merge   = args.pairwise_merge,
+            type_thresholds  = args.type_thresholds,
+            metapath_thresholds = args.metapath_thresholds,
+            edge_weight_mode = args.edge_weight_mode,
+            eval_protocol    = args.eval_protocol,
+            coarsen_l2_normalize = not args.raw_no_l2,
+            relprop_hops     = args.relprop_hops,
+            relprop_outdim   = args.relprop_outdim,
+            freeze_node_types = args.freeze_node_types,
         )
         records.append(r)
         print(
             f"node_ratio={r['node_ratio']:.3f}  "
             f"edge_ratio={r['edge_ratio']:.3f}  "
             f"t_total={r['t_total']:.1f}s  "
-            f"test_acc={r['test_acc']:.4f}"
+            f"test_acc={r['test_acc']:.4f}  "
+            f"oracle={r['oracle_acc']:.4f}"
         )
 
     # ── Summary table ─────────────────────────────────────────────────────────
     def stat(key):
-        vals = [r[key] for r in records]
-        return float(np.mean(vals)), float(np.std(vals))
+        vals = np.array([r[key] for r in records], dtype=float)
+        return float(np.nanmean(vals)), float(np.nanstd(vals))
 
     r0 = records[0]
 
@@ -1457,6 +1774,11 @@ def main():
     tt_m,  tt_s  = stat('t_train')
     tot_m, tot_s = stat('t_total')
     acc_m, acc_s = stat('test_acc')
+    oracle_m, oracle_s = stat('oracle_acc')
+    voracle_m, voracle_s = stat('oracle_val_acc')
+    ogap_m, ogap_s = stat('oracle_gap')
+    omix_m, omix_s = stat('oracle_mixed_frac')
+    opur_m, opur_s = stat('oracle_mean_purity')
 
     print(f"\n{'='*W}")
     print(f"  RESULTS   dataset={args.dataset}  "
@@ -1476,6 +1798,11 @@ def main():
     print(f"  {'Time  total':<28}: {_fmt(tot_m, tot_s, '.1f')} s")
     print()
     print(f"  {'Test accuracy':<28}: {_fmt(acc_m, acc_s, '.4f')}")
+    print(f"  {'Val oracle bound':<28}: {_fmt(voracle_m, voracle_s, '.4f')}")
+    print(f"  {'Oracle upper bound':<28}: {_fmt(oracle_m, oracle_s, '.4f')}"
+          f"  (gap {ogap_m:+.4f} 짹 {ogap_s:.4f})")
+    print(f"  {'Oracle mixed supernodes':<28}: {_fmt(omix_m, omix_s, '.3f')}"
+          f"  (mean purity {_fmt(opur_m, opur_s, '.3f')})")
 
     # ── Baseline comparison ───────────────────────────────────────────────────
     if base_records:

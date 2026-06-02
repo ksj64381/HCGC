@@ -44,15 +44,17 @@ except ImportError:
 # Flat array extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_flat_arrays(data):
+def extract_flat_arrays(data, l2_normalize=True):
     """Convert HeteroData to flat numpy arrays expected by the C++ kernel."""
     offsets, feats_list, feat_dims, boundaries = {}, [], [], []
     cur = 0
     for nt in _CFG.node_types:
         n = data[nt].num_nodes
         x = data[nt].x.float()
-        norm = x.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        x = (x / norm).numpy().astype(np.float32)
+        if l2_normalize:
+            norm = x.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            x = x / norm
+        x = x.numpy().astype(np.float32)
         feats_list.append(x.ravel())
         feat_dims.append(x.shape[1])
         cur += n
@@ -85,7 +87,8 @@ def extract_flat_arrays(data):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_compressed_data(data, coalition_map, offsets, type_boundaries,
-                          use_soft_labels=False, emb_dict=None, emb_temp=1.0):
+                          use_soft_labels=False, emb_dict=None, emb_temp=1.0,
+                          edge_weight_mode='binary'):
     """Map original nodes to supernodes and return a new HeteroData object.
 
     Returns: (cdata, local_cm, stats)
@@ -95,13 +98,15 @@ def build_compressed_data(data, coalition_map, offsets, type_boundaries,
     """
     cm = coalition_map.astype(np.int64)
 
-    local_cm, n_super = {}, {}
+    edge_weight_mode = str(edge_weight_mode or 'binary').lower()
+    local_cm, n_super, super_size = {}, {}, {}
     for i, nt in enumerate(_CFG.node_types):
         start = offsets[nt]
         end   = int(type_boundaries[i])
         roots_global, inverse = np.unique(cm[start:end], return_inverse=True)
         local_cm[nt] = torch.from_numpy(inverse.astype(np.int64))
         n_super[nt]  = len(roots_global)
+        super_size[nt] = torch.bincount(local_cm[nt], minlength=n_super[nt]).float()
 
     cdata = HeteroData()
 
@@ -223,8 +228,24 @@ def build_compressed_data(data, coalition_map, offsets, type_boundaries,
         ei    = data[et].edge_index
         new_s = local_cm[s_type][ei[0]]
         new_d = local_cm[d_type][ei[1]]
-        comp_ei = torch.unique(torch.stack([new_s, new_d]), dim=1).contiguous()
+        remapped = torch.stack([new_s, new_d])
+        comp_ei, counts = torch.unique(remapped, dim=1, return_counts=True)
+        comp_ei = comp_ei.contiguous()
         cdata[et].edge_index = comp_ei
+
+        if edge_weight_mode != 'binary':
+            ew = counts.float()
+            if edge_weight_mode == 'log_count':
+                ew = torch.log1p(ew)
+            elif edge_weight_mode == 'density':
+                src_sz = super_size[s_type][comp_ei[0]].clamp(min=1.0)
+                dst_sz = super_size[d_type][comp_ei[1]].clamp(min=1.0)
+                ew = ew / torch.sqrt(src_sz * dst_sz).clamp(min=1.0)
+            elif edge_weight_mode != 'count':
+                raise ValueError(
+                    "edge_weight_mode must be one of "
+                    "{'binary', 'count', 'log_count', 'density'}")
+            cdata[et].edge_weight = ew.contiguous()
 
         n_orig = ei.shape[1]
         n_comp = comp_ei.shape[1]
@@ -234,6 +255,7 @@ def build_compressed_data(data, coalition_map, offsets, type_boundaries,
             'orig': n_orig,
             'comp': n_comp,
             'ratio': n_orig / max(n_comp, 1),
+            'weight_mode': edge_weight_mode,
         }
 
     if orig_edges_total > 0:
@@ -373,6 +395,11 @@ def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
         _pt_arr = np.array(_pt_raw, dtype=np.float32)
     else:
         _pt_arr = np.array([], dtype=np.float32)
+    _pm_raw = getattr(args, 'hcgc_feat_var_scale_by_src_med', None)
+    if _pm_raw is not None and len(_pm_raw) > 0:
+        _pm_arr = np.array(_pm_raw, dtype=np.float32)
+    else:
+        _pm_arr = np.array([], dtype=np.float32)
 
     _ctx_mgr = _SuppressCStdout() if silent else contextlib.nullcontext()
     with _ctx_mgr:
@@ -381,8 +408,10 @@ def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
                 *_base_args,
                 getattr(args, 'hcgc_skip_reassignment', False),
                 getattr(args, 'hcgc_window_size', 20),
+                getattr(args, 'hcgc_merge_cap_per_leader', 0),
                 getattr(args, 'hub_anchor_percentile', 0.0),
                 _pt_arr,
+                _pm_arr,
                 float(getattr(args, 'hcgc_target_comp_ratio', 0.0)),
             )
         except TypeError:
@@ -475,7 +504,8 @@ def predict_scale_for_compression(ctx, target_ratio,
 # One-shot scale prediction (no HCGC runs required)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _sample_mediator_pair_energies(ctx, n_samples=3000, rng_seed=42):
+def _sample_mediator_pair_energies(ctx, n_samples=3000, rng_seed=42,
+                                   marginal_join_cost=False):
     """Sample normalised Dirichlet energies of same-type mediator-path pairs."""
     from collections import defaultdict
 
@@ -513,7 +543,7 @@ def _sample_mediator_pair_energies(ctx, n_samples=3000, rng_seed=42):
         feat_var_by_type[nt] = float(np.mean(np.var(x, axis=0).clip(min=1e-12)))
 
     if not feat_by_type:
-        return np.array([]), feat_var_by_type, {}
+        return np.array([]), feat_var_by_type, {}, {}, {}, {}
 
     n_sample_med = min(n_samples * 4, n_total)
     sampled_meds = rng.choice(n_total, n_sample_med, replace=False)
@@ -531,11 +561,17 @@ def _sample_mediator_pair_energies(ctx, n_samples=3000, rng_seed=42):
     _MAX_PAIRS_MED  = 5
 
     energies              = []
+    energies_by_type      = defaultdict(list)
+    energies_by_src_med   = defaultdict(list)
     med_degs_by_type      = defaultdict(list)
+    med_degs_by_src_med   = defaultdict(list)
 
     for m in sampled_meds:
         if len(energies) >= n_samples:
             break
+        t_med = int(type_of[int(m)])
+        if t_med < 0:
+            continue
 
         nbrs_by_type = defaultdict(list)
         for v, w in adj.get(m, []):
@@ -554,6 +590,7 @@ def _sample_mediator_pair_energies(ctx, n_samples=3000, rng_seed=42):
             fv        = feat_var_by_type.get(nt, 1.0)
 
             med_degs_by_type[t_src].append(len(nbrs))
+            med_degs_by_src_med[(t_src, t_med)].append(len(nbrs))
 
             if len(nbrs) > _MAX_NBRS:
                 idx  = rng.choice(len(nbrs), _MAX_NBRS, replace=False)
@@ -571,19 +608,35 @@ def _sample_mediator_pair_energies(ctx, n_samples=3000, rng_seed=42):
                     diff  = (x_t[u - s_t].astype(np.float64)
                              - x_t[v - s_t].astype(np.float64))
                     d2    = float(np.dot(diff, diff))
-                    energy = float(w_um * w_mv) * d2 / fv
+                    join_factor = 0.5 if marginal_join_cost else 1.0
+                    energy = join_factor * float(w_um * w_mv) * d2 / fv
                     if np.isfinite(energy) and energy > 0:
                         energies.append(energy)
+                        energies_by_type[t_src].append(energy)
+                        energies_by_src_med[(t_src, t_med)].append(energy)
                     pairs_done += 1
 
     energies = np.sort(np.asarray(energies, dtype=np.float64))
+    energies_by_type = {
+        t: np.sort(np.asarray(vals, dtype=np.float64))
+        for t, vals in energies_by_type.items()
+    }
+    energies_by_src_med = {
+        k: np.sort(np.asarray(vals, dtype=np.float64))
+        for k, vals in energies_by_src_med.items()
+    }
     avg_med_deg_by_type = {
         t: float(np.mean(degs)) for t, degs in med_degs_by_type.items() if degs
     }
-    return energies, feat_var_by_type, avg_med_deg_by_type
+    avg_med_deg_by_src_med = {
+        k: float(np.mean(degs)) for k, degs in med_degs_by_src_med.items() if degs
+    }
+    return (energies, feat_var_by_type, avg_med_deg_by_type,
+            energies_by_type, energies_by_src_med, avg_med_deg_by_src_med)
 
 
-def predict_scale_one_shot(ctx, target_ratio, n_samples=3000, verbose=True):
+def predict_scale_one_shot(ctx, target_ratio, n_samples=3000, verbose=True,
+                           marginal_join_cost=False):
     """Predict feat_var_scale for a target node retention ratio WITHOUT any HCGC runs.
 
     Args:
@@ -591,8 +644,9 @@ def predict_scale_one_shot(ctx, target_ratio, n_samples=3000, verbose=True):
     """
     t0 = time.time()
 
-    energies, feat_var_by_type, avg_med_deg_by_type = \
-        _sample_mediator_pair_energies(ctx, n_samples)
+    energies, feat_var_by_type, avg_med_deg_by_type, _, _, _ = \
+        _sample_mediator_pair_energies(
+            ctx, n_samples, marginal_join_cost=marginal_join_cost)
 
     _tc = 1.0 / max(float(target_ratio), 1e-6)
 
@@ -638,9 +692,212 @@ def predict_scale_one_shot(ctx, target_ratio, n_samples=3000, verbose=True):
     return predicted_scale, info
 
 
+def predict_type_threshold_bases(ctx, target_ratio, n_samples=3000,
+                                 verbose=True, marginal_join_cost=False):
+    """Estimate per-source-type normalized threshold bases.
+
+    The C++ kernel accepts per-type scales where
+        w_eff * dist_sq <= scale[t] * feat_var[t].
+    Since sampled energies are normalized as w_eff * dist_sq / feat_var[t],
+    the percentile value can be used directly as scale[t]. A single global
+    multiplier is still searched by auto_coarsen for final ratio control.
+    """
+    t0 = time.time()
+    energies, _, avg_med_deg_by_type, energies_by_type, _, _ = \
+        _sample_mediator_pair_energies(
+            ctx, n_samples, marginal_join_cost=marginal_join_cost)
+
+    _tc = 1.0 / max(float(target_ratio), 1e-6)
+    if len(energies) < 20:
+        scale, _ = predict_scale_for_compression(ctx, target_ratio, verbose=False)
+        bases = [max(float(scale), 1e-6) for _ in _CFG.node_types]
+        info = {
+            'fallback': True,
+            'n_samples': int(len(energies)),
+            'bases': bases,
+            'elapsed_sampling': round(time.time() - t0, 3),
+        }
+        if verbose:
+            print("  [AutoType] Too few mediator pairs; using global fallback "
+                  f"base={scale:.5f}")
+        return bases, info
+
+    if avg_med_deg_by_type:
+        global_avg_deg = float(np.median(list(avg_med_deg_by_type.values())))
+    else:
+        global_avg_deg = 3.0
+    global_alpha = float(np.clip(global_avg_deg / 2.0, 1.0, 6.0))
+    global_p = (1.0 - 1.0 / max(_tc, 1.01)) / global_alpha
+    global_p = float(np.clip(global_p, 0.005, 0.90))
+    global_base = float(np.percentile(energies, global_p * 100))
+    global_base = max(global_base, 1e-6)
+
+    bases = []
+    rows = []
+    for t, nt in enumerate(_CFG.node_types):
+        arr = energies_by_type.get(t)
+        avg_deg = avg_med_deg_by_type.get(t, global_avg_deg)
+        alpha = float(np.clip(avg_deg / 2.0, 1.0, 6.0))
+        p_target = (1.0 - 1.0 / max(_tc, 1.01)) / alpha
+        p_target = float(np.clip(p_target, 0.005, 0.90))
+
+        if arr is None or len(arr) < 20:
+            base = global_base
+            fallback = True
+            n_t = 0 if arr is None else int(len(arr))
+        else:
+            base = float(np.percentile(arr, p_target * 100))
+            base = max(base, 1e-6)
+            fallback = False
+            n_t = int(len(arr))
+
+        bases.append(base)
+        rows.append({
+            'type': nt,
+            'type_id': t,
+            'n_samples': n_t,
+            'avg_med_deg': float(avg_deg),
+            'alpha': alpha,
+            'p_target': p_target,
+            'base': base,
+            'fallback': fallback,
+        })
+
+    elapsed = time.time() - t0
+    if verbose:
+        print(f"  [AutoType] per-type threshold bases from {len(energies)} "
+              f"mediator pairs ({elapsed:.2f}s)")
+        for row in rows:
+            tag = " fallback" if row['fallback'] else ""
+            print(f"    type={row['type']:<12} n={row['n_samples']:>5}  "
+                  f"p={row['p_target']:.3f}  base={row['base']:.5f}{tag}")
+
+    info = {
+        'fallback': False,
+        'n_samples': int(len(energies)),
+        'global_base': global_base,
+        'global_p': global_p,
+        'bases': bases,
+        'rows': rows,
+        'elapsed_sampling': round(elapsed, 3),
+    }
+    return bases, info
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Probe helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+def predict_metapath_threshold_bases(ctx, target_ratio, n_samples=3000,
+                                     verbose=True, marginal_join_cost=False):
+    """Estimate per-(source type, mediator type) threshold bases."""
+    t0 = time.time()
+    (energies, _, avg_med_deg_by_type, energies_by_type,
+     energies_by_src_med, avg_med_deg_by_src_med) = \
+        _sample_mediator_pair_energies(
+            ctx, n_samples, marginal_join_cost=marginal_join_cost)
+
+    node_types = list(_CFG.node_types)
+    n_types = len(node_types)
+    _tc = 1.0 / max(float(target_ratio), 1e-6)
+
+    if len(energies) < 20:
+        scale, _ = predict_scale_for_compression(ctx, target_ratio, verbose=False)
+        bases = [max(float(scale), 1e-6) for _ in range(n_types * n_types)]
+        info = {
+            'fallback': True,
+            'n_samples': int(len(energies)),
+            'bases': bases,
+            'elapsed_sampling': round(time.time() - t0, 3),
+        }
+        if verbose:
+            print("  [AutoMetapath] Too few mediator pairs; using global "
+                  f"fallback base={scale:.5f}")
+        return bases, info
+
+    if avg_med_deg_by_type:
+        global_avg_deg = float(np.median(list(avg_med_deg_by_type.values())))
+    else:
+        global_avg_deg = 3.0
+    global_alpha = float(np.clip(global_avg_deg / 2.0, 1.0, 6.0))
+    global_p = (1.0 - 1.0 / max(_tc, 1.01)) / global_alpha
+    global_p = float(np.clip(global_p, 0.005, 0.90))
+    global_base = float(np.percentile(energies, global_p * 100))
+    global_base = max(global_base, 1e-6)
+
+    source_bases = []
+    for t_src in range(n_types):
+        arr = energies_by_type.get(t_src)
+        avg_deg = avg_med_deg_by_type.get(t_src, global_avg_deg)
+        alpha = float(np.clip(avg_deg / 2.0, 1.0, 6.0))
+        p_target = (1.0 - 1.0 / max(_tc, 1.01)) / alpha
+        p_target = float(np.clip(p_target, 0.005, 0.90))
+        if arr is None or len(arr) < 20:
+            source_bases.append(global_base)
+        else:
+            source_bases.append(max(float(np.percentile(arr, p_target * 100)), 1e-6))
+
+    bases = []
+    rows = []
+    for t_src, src_name in enumerate(node_types):
+        for t_med, med_name in enumerate(node_types):
+            arr = energies_by_src_med.get((t_src, t_med))
+            avg_deg = avg_med_deg_by_src_med.get(
+                (t_src, t_med),
+                avg_med_deg_by_type.get(t_src, global_avg_deg))
+            alpha = float(np.clip(avg_deg / 2.0, 1.0, 6.0))
+            p_target = (1.0 - 1.0 / max(_tc, 1.01)) / alpha
+            p_target = float(np.clip(p_target, 0.005, 0.90))
+
+            if arr is None or len(arr) < 20:
+                base = source_bases[t_src]
+                fallback = True
+                n_cell = 0 if arr is None else int(len(arr))
+            else:
+                base = float(np.percentile(arr, p_target * 100))
+                base = max(base, 1e-6)
+                fallback = False
+                n_cell = int(len(arr))
+
+            bases.append(base)
+            rows.append({
+                'src': src_name,
+                'src_id': t_src,
+                'med': med_name,
+                'med_id': t_med,
+                'n_samples': n_cell,
+                'avg_med_deg': float(avg_deg),
+                'alpha': alpha,
+                'p_target': p_target,
+                'base': base,
+                'fallback': fallback,
+            })
+
+    elapsed = time.time() - t0
+    if verbose:
+        print(f"  [AutoMetapath] per-(src,med) threshold bases from "
+              f"{len(energies)} mediator pairs ({elapsed:.2f}s)")
+        for t_src, src_name in enumerate(node_types):
+            cells = []
+            for t_med, med_name in enumerate(node_types):
+                row = rows[t_src * n_types + t_med]
+                tag = "*" if row['fallback'] else ""
+                cells.append(f"{med_name}:{row['base']:.4g}{tag}")
+            print(f"    src={src_name:<12} " + "  ".join(cells))
+        print("    (* fallback to source/global base)")
+
+    info = {
+        'fallback': False,
+        'n_samples': int(len(energies)),
+        'global_base': global_base,
+        'global_p': global_p,
+        'source_bases': source_bases,
+        'bases': bases,
+        'rows': rows,
+        'elapsed_sampling': round(elapsed, 3),
+    }
+    return bases, info
+
 
 def _probe_from_coalition_map(coalition_map, ctx):
     """Compute linear probe accuracy from a coalition map (no GNN training)."""
@@ -768,7 +1025,28 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
     def _overall_comp(cm):
         return int(_tbounds[-1]) / max(len(np.unique(cm)), 1)
 
+    _marginal_join_cost = getattr(args, 'hcgc_merge_cap_per_leader', 0) > 0
+    _metapath_threshold_info = None
+    _type_threshold_info = None
+    _metapath_base = list(getattr(args, 'hcgc_feat_var_scale_by_src_med', None) or [])
     _pertype_base = list(getattr(args, 'hcgc_feat_var_scale_by_type', None) or [])
+    if (getattr(args, 'hcgc_auto_metapath_thresholds', False)
+            and not _metapath_base):
+        _metapath_base, _metapath_threshold_info = predict_metapath_threshold_bases(
+            ctx, target_ratio, verbose=verbose,
+            marginal_join_cost=_marginal_join_cost)
+        args.hcgc_feat_var_scale_by_src_med = list(_metapath_base)
+        calib_args.hcgc_feat_var_scale_by_src_med = list(_metapath_base)
+    if (not _metapath_base
+            and getattr(args, 'hcgc_auto_type_thresholds', False)
+            and not _pertype_base):
+        _pertype_base, _type_threshold_info = predict_type_threshold_bases(
+            ctx, target_ratio, verbose=verbose,
+            marginal_join_cost=_marginal_join_cost)
+        args.hcgc_feat_var_scale_by_type = list(_pertype_base)
+        calib_args.hcgc_feat_var_scale_by_type = list(_pertype_base)
+
+    _use_metapath = bool(_metapath_base)
     _use_pertype  = bool(_pertype_base)
 
     if run_probe:
@@ -781,8 +1059,11 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
         if verbose:
             print(f"  [AutoCoarsen] Baseline probe: skipped (run_probe=False)")
 
-    cdf_scale, _ = predict_scale_for_compression(
-        ctx, target_ratio, verbose=False)
+    if _use_metapath or _use_pertype:
+        cdf_scale = 1.0
+    else:
+        cdf_scale, _ = predict_scale_for_compression(
+            ctx, target_ratio, verbose=False)
 
     run_log     = []
     seen_scales = set()
@@ -819,7 +1100,13 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
                 return existing['cm'], existing['comp'], existing['t']
         seen_scales.add(key)
 
-        if _use_pertype:
+        if _use_metapath:
+            calib_args.hcgc_feat_var_scale_by_src_med = [
+                v * scale for v in _metapath_base
+            ]
+            cm_raw, _, t = _run_coarsen_cheap(
+                ctx, calib_args, calib_args.hcgc_feat_var_scale)
+        elif _use_pertype:
             calib_args.hcgc_feat_var_scale_by_type = [v * scale for v in _pertype_base]
             cm_raw, _, t = _run_coarsen_cheap(
                 ctx, calib_args, calib_args.hcgc_feat_var_scale)
@@ -829,46 +1116,88 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
         return cm_raw, _overall_comp(cm_raw), t
 
     def _writeback(s):
-        if _use_pertype:
+        if _use_metapath:
+            args.hcgc_feat_var_scale_by_src_med = [
+                v * s for v in _metapath_base
+            ]
+        elif _use_pertype:
             args.hcgc_feat_var_scale_by_type = [v * s for v in _pertype_base]
         else:
             args.hcgc_feat_var_scale = s
 
     def _make_info(comp, probe_after, probe_loss_, scale_, n_runs, saturated=False):
-        return {
+        info = {
             'compression':    round(comp, 4),
             'probe_baseline': round(baseline, 4),
             'probe_after':    round(probe_after, 4),
             'probe_loss':     round(probe_loss_, 4),
             'scale_used':     round(float(scale_), 6),
+            'threshold_mode':  'metapath' if _use_metapath
+                               else 'type' if _use_pertype else 'global',
             'n_coarsen_runs': n_runs,
             'saturated':      saturated,
             'all_runs':       [{'scale': r['scale'], 'comp': r['comp'],
                                 'probe_loss': r['probe_loss']} for r in run_log],
         }
+        if _use_metapath:
+            info['metapath_threshold_bases'] = [
+                round(float(v), 6) for v in _metapath_base
+            ]
+            info['metapath_threshold_effective'] = [
+                round(float(v) * float(scale_), 6) for v in _metapath_base
+            ]
+            if _metapath_threshold_info is not None:
+                info['metapath_threshold_info'] = _metapath_threshold_info
+        if _use_pertype:
+            info['type_threshold_bases'] = [
+                round(float(v), 6) for v in _pertype_base
+            ]
+            info['type_threshold_effective'] = [
+                round(float(v) * float(scale_), 6) for v in _pertype_base
+            ]
+            if _type_threshold_info is not None:
+                info['type_threshold_info'] = _type_threshold_info
+        return info
 
     # ── Fast-scale mode ───────────────────────────────────────────────────────
     if fast_scale:
         if verbose:
-            print(f"\n  [AutoCoarsen] Fast-scale mode  (one-shot + up to 3 corrections)")
+            _max_corr_label = 4 if (_use_metapath or _use_pertype) else 3
+            print(f"\n  [AutoCoarsen] Fast-scale mode  "
+                  f"(one-shot + up to {_max_corr_label} corrections)")
 
-        one_shot_scale, one_shot_info = predict_scale_one_shot(
-            ctx, target_ratio, verbose=verbose)
+        if _use_metapath:
+            one_shot_scale = 1.0
+            one_shot_info = {'metapath_thresholds': True}
+            if verbose:
+                print("  [AutoCoarsen] Metapath thresholds ON: "
+                      "using multiplier seed=1.00000")
+        elif _use_pertype:
+            one_shot_scale = 1.0
+            one_shot_info = {'type_thresholds': True}
+            if verbose:
+                print("  [AutoCoarsen] Type thresholds ON: "
+                      "using multiplier seed=1.00000")
+        else:
+            one_shot_scale, one_shot_info = predict_scale_one_shot(
+                ctx, target_ratio, verbose=verbose,
+                marginal_join_cost=_marginal_join_cost)
         cm_os, comp_os, t_os = _run_if_new(one_shot_scale)
         _record(one_shot_scale, cm_os, comp_os, t_os)
 
+        _FAST_ACCEPT_TOL = 0.10 if (_use_metapath or _use_pertype) else 0.20
         rel_err = abs(comp_os - target_compression) / max(target_compression, 1.0)
         if verbose:
             print(f"  [AutoCoarsen] One-shot: scale={one_shot_scale:.5f}  "
                   f"comp={comp_os:.2f}x  err={rel_err*100:.1f}%")
 
-        if rel_err <= 0.20:
+        if rel_err <= _FAST_ACCEPT_TOL:
             best_cm, best_comp, best_t, mid_scale = cm_os, comp_os, t_os, one_shot_scale
         else:
-            _MAX_CORR = 3
+            _MAX_CORR = 4 if (_use_metapath or _use_pertype) else 3
             _BETA_OVER = 2.5
             _BETA_UNDER = 0.8
-            _TOL = 0.25
+            _TOL = 0.10 if (_use_metapath or _use_pertype) else 0.25
 
             cur_scale = one_shot_scale
             cur_comp  = comp_os
@@ -906,7 +1235,15 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
         if verbose:
             print(f"\n  [AutoCoarsen] FINAL  ({n_runs} coarsening runs, fast-scale)")
             print(f"    compression = {best_comp:.2f}x  (target {target_compression:.1f}x)")
-            if _use_pertype:
+            if _use_metapath:
+                n_types = len(_CFG.node_types)
+                eff = [round(v * mid_scale, 4) for v in _metapath_base]
+                print(f"    multiplier  = {mid_scale:.5f}  "
+                      f"(metapath matrix {n_types}x{n_types})")
+                for i, nt in enumerate(_CFG.node_types):
+                    row = eff[i * n_types:(i + 1) * n_types]
+                    print(f"      {nt}: {row}")
+            elif _use_pertype:
                 eff = [round(v * mid_scale, 4) for v in _pertype_base]
                 print(f"    multiplier  = {mid_scale:.5f}  (per-type: {eff})")
             else:

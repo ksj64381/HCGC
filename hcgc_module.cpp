@@ -66,6 +66,11 @@ struct CSRGraph {
   // Falls back to the global feat_var_scale scalar when empty or out-of-range.
   std::vector<float> feat_var_scale_per_type;
 
+  // If non-empty: threshold for (source type, mediator type) =
+  // feat_var_scale_by_src_med[src * num_types + med] * feat_var[src].
+  // Falls back to per-source-type and then global scale.
+  std::vector<float> feat_var_scale_by_src_med;
+
   // ── Scalability caps ──────────────────────────────────────────────────────
   int              max_candidates_per_mediator = 0;
   int              max_hub_degree = 0;
@@ -78,6 +83,18 @@ struct CSRGraph {
     if (!hub_degree_caps.empty() && t >= 0 && t < (int)hub_degree_caps.size())
       return hub_degree_caps[t];
     return max_hub_degree;
+  }
+
+  inline float threshold_scale_for_pair(int t_src, int t_med,
+                                        float fallback) const {
+    int idx = t_src * num_types + t_med;
+    if (!feat_var_scale_by_src_med.empty() &&
+        idx >= 0 && idx < (int)feat_var_scale_by_src_med.size())
+      return feat_var_scale_by_src_med[idx];
+    if (!feat_var_scale_per_type.empty() &&
+        t_src >= 0 && t_src < (int)feat_var_scale_per_type.size())
+      return feat_var_scale_per_type[t_src];
+    return fallback;
   }
 
   // ── Auto hub-degree caps (mean + k_sigma * std of total degree per type) ──
@@ -307,6 +324,32 @@ struct CSRGraph {
     coalition_size[into] += coalition_size[from];
     coalition_size[from]  = 0;
     coalition_map[from]   = into;
+  }
+
+  inline float coalition_centroid_dist_sq(int a, int b, int dim) const {
+    float cnt_a = static_cast<float>(std::max(1, coalition_size[a]));
+    float cnt_b = static_cast<float>(std::max(1, coalition_size[b]));
+    float dist_sq = 0.0f;
+    for (int d = 0; d < dim; ++d) {
+      float fa = coalition_feat_sum[a][d] / cnt_a;
+      float fb = coalition_feat_sum[b][d] / cnt_b;
+      float diff = fa - fb;
+      dist_sq += diff * diff;
+    }
+    return dist_sq;
+  }
+
+  inline float coalition_merge_cost(int into, int from, int dim,
+                                    float w_eff,
+                                    bool marginal_join_cost) const {
+    float dist_sq = coalition_centroid_dist_sq(into, from, dim);
+    if (!marginal_join_cost)
+      return w_eff * dist_sq;
+
+    float cnt_into = static_cast<float>(std::max(1, coalition_size[into]));
+    float cnt_from = static_cast<float>(std::max(1, coalition_size[from]));
+    float ward = (cnt_into * cnt_from) / std::max(cnt_into + cnt_from, 1.0f);
+    return w_eff * ward * dist_sq;
   }
 
   void init_coalition_map() {
@@ -586,7 +629,8 @@ struct CSRGraph {
                                              float feat_var_scale,
                                              bool skip_reassignment,
                                              int outer_idx,
-                                             int window_size = 20) {
+                                             int window_size = 20,
+                                             int merge_cap_per_leader = 0) {
     std::mt19937 rng(42 + outer_idx);
     std::normal_distribution<float> rand_dist(0.0f, 1.0f);
 
@@ -599,16 +643,14 @@ struct CSRGraph {
         std::vector<float> proj_vec(dim);
         for (int d = 0; d < dim; ++d) proj_vec[d] = rand_dist(rng);
 
-        float eff_scale_ball = (!feat_var_scale_per_type.empty() &&
-                                t_src < (int)feat_var_scale_per_type.size())
-                               ? feat_var_scale_per_type[t_src] : feat_var_scale;
-        float threshold = eff_scale_ball *
-                          ((t_src < (int)feat_var.size()) ? feat_var[t_src] : 1.0f);
-
         for (int t_med = 0; t_med < num_types; ++t_med) {
           int med_start = (t_med > 0) ? type_boundaries[t_med - 1] : 0;
           int med_end   = type_boundaries[t_med];
           int cap_med   = hub_cap_for_type(t_med);
+          float eff_scale_ball = threshold_scale_for_pair(
+              t_src, t_med, feat_var_scale);
+          float threshold = eff_scale_ball *
+                            ((t_src < (int)feat_var.size()) ? feat_var[t_src] : 1.0f);
 
           // Rank mediators by number of t_src neighbours (highest first)
           std::vector<std::pair<int,int>> leaders;
@@ -687,11 +729,12 @@ struct CSRGraph {
 
             // 3-phase Ball Multi-Merge: avoids the greedy first-come-first-merged
             // bias by electing leaders based on local density before merging.
+            bool marginal_join_cost = (merge_cap_per_leader > 0);
+
             // Phase 1: Density Estimation
             std::vector<int> density(candidates.size(), 0);
             for (size_t i = 0; i < candidates.size(); ++i) {
               int cu = find_root(candidates[i].first);
-              float cnt_u = static_cast<float>(std::max(1, coalition_size[cu]));
               int start_j = std::max(0, static_cast<int>(i) - window_size);
               int end_j   = std::min(static_cast<int>(candidates.size()),
                                      static_cast<int>(i) + window_size + 1);
@@ -699,16 +742,10 @@ struct CSRGraph {
                 if (i == (size_t)j) continue;
                 int cv = find_root(candidates[j].first);
                 if (cu == cv) { density[i]++; continue; }
-                float cnt_v = static_cast<float>(std::max(1, coalition_size[cv]));
-                float dist_sq = 0.0f;
-                for (int d = 0; d < dim; ++d) {
-                  float fu = coalition_feat_sum[cu][d] / cnt_u;
-                  float fv = coalition_feat_sum[cv][d] / cnt_v;
-                  float diff = fu - fv;
-                  dist_sq += diff * diff;
-                }
                 float w_eff = candidates[i].second * candidates[j].second;
-                if (w_eff * dist_sq <= threshold) density[i]++;
+                float cost = coalition_merge_cost(cu, cv, dim, w_eff,
+                                                  marginal_join_cost);
+                if (cost <= threshold) density[i]++;
               }
             }
 
@@ -721,6 +758,11 @@ struct CSRGraph {
             // Phase 3: Ball Multi-Merge (union-find)
             // merge_coalitions() updates coalition_feat_sum[cu] in-place,
             // so each subsequent comparison sees the grown centroid.
+            //
+            // If merge_cap_per_leader > 0, the density leader only accepts the
+            // cheapest eligible candidate(s) under marginal join cost:
+            //   Δ = w_eff * |C||S|/(|C|+|S|) * ||mu_C - mu_S||^2.
+            // cap=1 gives the CGC-like one-by-one coalition formation ablation.
             std::vector<bool> local_matched(candidates.size(), false);
             for (size_t idx = 0; idx < candidates.size(); ++idx) {
               size_t ci = density_order[idx];
@@ -734,31 +776,53 @@ struct CSRGraph {
                                      static_cast<int>(ci) + window_size + 1);
 
               bool any_merge = false;
-              for (int j = start_j; j < end_j; ++j) {
-                if (local_matched[j]) continue;
-                int v = candidates[j].first;
-                if (matched[v]) continue;
-                int cv = find_root(v);
-                if (cu == cv) continue;
+              int merges_for_leader = 0;
 
-                float cnt_u = static_cast<float>(std::max(1, coalition_size[cu]));
-                float cnt_v = static_cast<float>(std::max(1, coalition_size[cv]));
-                float dist_sq = 0.0f;
-                for (int d = 0; d < dim; ++d) {
-                  float fu = coalition_feat_sum[cu][d] / cnt_u;
-                  float fv = coalition_feat_sum[cv][d] / cnt_v;
-                  float diff = fu - fv;
-                  dist_sq += diff * diff;
+              while (merge_cap_per_leader <= 0 ||
+                     merges_for_leader < merge_cap_per_leader) {
+                int best_j = -1;
+                float best_cost = std::numeric_limits<float>::infinity();
+
+                for (int j = start_j; j < end_j; ++j) {
+                  if (local_matched[j]) continue;
+                  int v = candidates[j].first;
+                  if (matched[v]) continue;
+                  int cv = find_root(v);
+                  if (cu == cv) continue;
+
+                  float w_eff = candidates[ci].second * candidates[j].second;
+                  float cost = coalition_merge_cost(cu, cv, dim, w_eff,
+                                                    marginal_join_cost);
+                  if (cost > threshold) continue;
+
+                  if (merge_cap_per_leader <= 0) {
+                    merge_coalitions(cv, cu);
+                    local_matched[j] = true;
+                    matched[v]       = true;
+                    any_merge        = true;
+                    ++merges_for_leader;
+                    ++total_merges;
+                    ++merges_this_outer;
+                  } else if (cost < best_cost) {
+                    best_cost = cost;
+                    best_j = j;
+                  }
                 }
-                float w_eff = candidates[ci].second * candidates[j].second;
-                if (w_eff * dist_sq <= threshold) {
-                  merge_coalitions(cv, cu);
-                  local_matched[j] = true;
-                  matched[v]       = true;
-                  any_merge        = true;
-                  ++total_merges;
-                  ++merges_this_outer;
-                }
+
+                if (merge_cap_per_leader <= 0) break;
+                if (best_j < 0) break;
+
+                int best_v = candidates[best_j].first;
+                int best_cv = find_root(best_v);
+                if (best_cv == cu) break;
+
+                merge_coalitions(best_cv, cu);
+                local_matched[best_j] = true;
+                matched[best_v]       = true;
+                any_merge             = true;
+                ++merges_for_leader;
+                ++total_merges;
+                ++merges_this_outer;
               }
 
               if (any_merge) {
@@ -837,8 +901,10 @@ create_graph_hcgc(py::array_t<int>   src_nodes,
                   bool  auto_hub_caps          = true,
                   bool  skip_reassignment      = false,
                   int   window_size            = 20,
+                  int   merge_cap_per_leader   = 0,
                   float hub_anchor_percentile  = 0.0f,
                   py::array_t<float> feat_var_scale_per_type_arr = py::array_t<float>(),
+                  py::array_t<float> feat_var_scale_by_src_med_arr = py::array_t<float>(),
                   float target_comp_ratio = 0.0f) {
 
   py::buffer_info src_buf   = src_nodes.request();
@@ -892,6 +958,33 @@ create_graph_hcgc(py::array_t<int>   src_nodes,
     }
   }
 
+  // Per-(source type, mediator type) feat_var_scale. This is the closest
+  // analogue to the old metapath-specific threshold calibration.
+  {
+    py::buffer_info pm_buf = feat_var_scale_by_src_med_arr.request();
+    int pm_len = static_cast<int>(pm_buf.shape[0]);
+    int expected = num_types * num_types;
+    if (pm_len > 0) {
+      const float *pm_ptr = static_cast<const float *>(pm_buf.ptr);
+      graph.feat_var_scale_by_src_med.assign(pm_ptr, pm_ptr + pm_len);
+      std::cout << "[HCGC] Per-(src,med) feat_var_scale:";
+      for (int s = 0; s < num_types; ++s) {
+        std::cout << "\n  src " << s << ": [";
+        for (int m = 0; m < num_types; ++m) {
+          int idx = s * num_types + m;
+          float val = (idx < pm_len) ? pm_ptr[idx] : feat_var_scale;
+          std::cout << val << (m + 1 < num_types ? ", " : "");
+        }
+        std::cout << "]";
+      }
+      if (pm_len != expected)
+        std::cout << "\n  [warn] expected " << expected
+                  << " values, got " << pm_len << "; missing cells fallback.";
+      std::cout << "\n";
+      std::cout.flush();
+    }
+  }
+
   graph.hub_anchor_percentile = hub_anchor_percentile;
   graph.init_coalition_map();
   graph.compute_feat_var();
@@ -927,6 +1020,7 @@ create_graph_hcgc(py::array_t<int>   src_nodes,
     g->max_hub_degree              = src->max_hub_degree;
     g->hub_anchor_percentile       = src->hub_anchor_percentile;
     g->feat_var_scale_per_type     = src->feat_var_scale_per_type;  // inherit per-type scales
+    g->feat_var_scale_by_src_med   = src->feat_var_scale_by_src_med;
     if (auto_hub_caps) g->compute_auto_hub_caps();
     else               g->hub_degree_caps = src->hub_degree_caps;
     g->init_coalition_map();
@@ -976,7 +1070,8 @@ create_graph_hcgc(py::array_t<int>   src_nodes,
       std::cout.flush();
 
       auto [m, s] = cur_ptr->coarse_graph_hcgc_once(
-          inner_passes, feat_var_scale, skip_reassignment, outer, window_size);
+          inner_passes, feat_var_scale, skip_reassignment, outer,
+          window_size, merge_cap_per_leader);
       std::cout << "[HCGC] Outer " << (outer+1) << ": "
                 << m << " merges, " << s << " switches\n";
       std::cout.flush();
@@ -1103,7 +1198,9 @@ PYBIND11_MODULE(hcgc_module, m) {
         py::arg("auto_hub_caps")         = true,
         py::arg("skip_reassignment")          = false,
         py::arg("window_size")                = 20,
+        py::arg("merge_cap_per_leader")       = 0,
         py::arg("hub_anchor_percentile")      = 0.0f,
         py::arg("feat_var_scale_per_type")    = py::array_t<float>(),
+        py::arg("feat_var_scale_by_src_med")  = py::array_t<float>(),
         py::arg("target_comp_ratio")          = 0.0f);
 }
