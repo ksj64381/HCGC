@@ -26,6 +26,7 @@ import numpy as np
 
 from benchmark import (
     LOADERS,
+    _COMPRESSORS,
     _DOWNSTREAM_MODELS,
     _add_degree_features,
     _FULL_BATCH_NODE_LIMIT,
@@ -41,10 +42,11 @@ from benchmark import (
 def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
               pretrain=True, train_epochs=200, train_hidden=256,
               mini_batch_size=512, model_name='sage', baseline=True,
+              baseline_stats=None,
               emb_method='gnn', coarsen_l2_normalize=True,
               relprop_hops=2, relprop_outdim=128,
               type_thresholds=False, metapath_thresholds=False,
-              edge_weight_mode='binary'):
+              edge_weight_mode='binary', compressor='hcgc'):
     """Run compress?뭪rain for each ratio and return collected stats.
 
     Returns
@@ -58,6 +60,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     print(f"{'='*W}")
     print(f"  dataset  : {dataset}")
     print(f"  ratios   : {ratios}")
+    print(f"  compressor: {compressor} ({_COMPRESSORS[compressor]})")
     print(f"  model    : {model_name}")
     print(f"  pretrain : {pretrain}")
     print(f"  emb      : {emb_method if pretrain else 'raw'}")
@@ -83,8 +86,12 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
         print(f"  [large graph -mini-batch downstream (batch_size={mini_batch_size})]")
 
     # ?? Baseline ??????????????????????????????????????????????????????????????
-    base_stats = None
-    if baseline:
+    base_stats = baseline_stats
+    if base_stats is not None:
+        print(f"\nBaseline: reusing original-graph result "
+              f"acc={base_stats['acc_mean']:.4f} +/- {base_stats['acc_std']:.4f} "
+              f"t={base_stats['t_mean']:.1f}s")
+    elif baseline:
         print(f"\nBaseline: training on original graph ({runs} runs) ...")
         base_recs = []
         for i in range(runs):
@@ -118,7 +125,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      relprop_outdim=relprop_outdim,
                      type_thresholds=type_thresholds,
                      metapath_thresholds=metapath_thresholds,
-                     edge_weight_mode=edge_weight_mode)
+                     edge_weight_mode=edge_weight_mode,
+                     compressor=compressor)
             print(f"  warmup {i+1}/{warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
@@ -131,7 +139,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      relprop_outdim=relprop_outdim,
                      type_thresholds=type_thresholds,
                      metapath_thresholds=metapath_thresholds,
-                     edge_weight_mode=edge_weight_mode)
+                     edge_weight_mode=edge_weight_mode,
+                     compressor=compressor)
             print(f"  warmup {i+1}/{warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ?? Ratio sweep ???????????????????????????????????????????????????????????
@@ -158,6 +167,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                 type_thresholds = type_thresholds,
                 metapath_thresholds = metapath_thresholds,
                 edge_weight_mode = edge_weight_mode,
+                compressor      = compressor,
             )
             recs.append(r)
             print(f"comp={r['compression']:.2f}x  "
@@ -251,7 +261,7 @@ def print_sweep_table(base_stats, sweep, dataset):
     print(f"{'='*W}\n")
 
 
-def save_sweep_plot(sweep, dataset, model_name, plot_dir):
+def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc'):
     if not plot_dir:
         return None
     import json
@@ -260,9 +270,10 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir):
 
     out_dir = Path(plot_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"proxy_sweep_{dataset}_{model_name}.png"
-    json_path = out_dir / f"proxy_sweep_{dataset}_{model_name}.json"
-    csv_path = out_dir / f"proxy_sweep_{dataset}_{model_name}.csv"
+    stem = f"proxy_sweep_{dataset}_{model_name}_{compressor}"
+    out_path = out_dir / f"{stem}.png"
+    json_path = out_dir / f"{stem}.json"
+    csv_path = out_dir / f"{stem}.csv"
 
     x = np.array([e['comp_mean'] for e in sweep], dtype=float)
     order = np.argsort(x)
@@ -277,7 +288,7 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir):
         'val_oracle': arr('val_oracle_mean').tolist(),
         'test_oracle': arr('oracle_mean').tolist(),
         'emb_dist': arr('emb_dist_mean').tolist(),
-        'title': f'{dataset} {model_name} compression proxy sweep',
+        'title': f'{dataset} {model_name} {compressor} compression proxy sweep',
         'out': str(out_path),
     }
     with json_path.open('w', encoding='utf-8') as f:
@@ -328,6 +339,159 @@ plt.close(fig)
     return out_path
 
 
+def print_compressor_table(all_results, dataset, models, compressors):
+    W = 104
+    print(f"\n{'='*W}")
+    print(f"  COMPRESSOR COMPARISON   dataset={dataset}")
+    print(f"{'='*W}")
+    print(f"  {'model':>8}  {'compressor':>12}  {'ratio':>6}  {'compr.':>7}  "
+          f"{'test_acc':>14}  {'drop':>8}  {'val_orcl':>8}  "
+          f"{'emb_d':>7}  {'t_total':>9}")
+    print("  " + "-" * 100)
+
+    for model_name in models:
+        for compressor in compressors:
+            base_stats, sweep = all_results[(model_name, compressor)]
+            for e in sweep:
+                acc = f"{e['acc_mean']:.4f}+/-{e['acc_std']:.4f}"
+                drop = e.get('acc_drop', float('nan'))
+                drop_str = 'n/a' if np.isnan(drop) else f"{drop:+.4f}"
+                print(f"  {model_name:>8}  {compressor:>12}  "
+                      f"{e['ratio']:>6.2f}  {e['comp_mean']:>6.2f}x  "
+                      f"{acc:>14}  {drop_str:>8}  "
+                      f"{e.get('val_oracle_mean', float('nan')):>8.4f}  "
+                      f"{e.get('emb_dist_mean', float('nan')):>7.4f}  "
+                      f"{e['tt_mean']:>8.1f}s")
+    print(f"{'='*W}\n")
+
+
+def save_comparison_outputs(all_results, dataset, models, compressors,
+                            plot_dir):
+    if not plot_dir:
+        return None
+    import csv
+    import json
+    import subprocess
+
+    out_dir = Path(plot_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_tag = '-'.join(models)
+    comp_tag = '-'.join(compressors)
+    stem = f"compressor_compare_{dataset}_{model_tag}_{comp_tag}"
+    csv_path = out_dir / f"{stem}.csv"
+    json_path = out_dir / f"{stem}.json"
+    png_path = out_dir / f"{stem}.png"
+
+    rows = []
+    for model_name in models:
+        for compressor in compressors:
+            base_stats, sweep = all_results[(model_name, compressor)]
+            for e in sweep:
+                row = {
+                    'dataset': dataset,
+                    'model': model_name,
+                    'compressor': compressor,
+                    'ratio': e['ratio'],
+                    'compression': e['comp_mean'],
+                    'test_acc_mean': e['acc_mean'],
+                    'test_acc_std': e['acc_std'],
+                    'acc_drop': e.get('acc_drop', float('nan')),
+                    'val_oracle': e.get('val_oracle_mean', float('nan')),
+                    'test_oracle': e.get('oracle_mean', float('nan')),
+                    'emb_dist': e.get('emb_dist_mean', float('nan')),
+                    'emb_cos': e.get('emb_cos_mean', float('nan')),
+                    't_total': e['tt_mean'],
+                    't_compress': e['tc_mean'],
+                    't_train': e['tr_mean'],
+                    'train_speedup': e.get('train_speedup', float('nan')),
+                    'baseline_acc_mean': (
+                        base_stats['acc_mean'] if base_stats is not None
+                        else float('nan')),
+                    'baseline_acc_std': (
+                        base_stats['acc_std'] if base_stats is not None
+                        else float('nan')),
+                    'baseline_t_train': (
+                        base_stats['t_mean'] if base_stats is not None
+                        else float('nan')),
+                }
+                rows.append(row)
+
+    fieldnames = list(rows[0].keys()) if rows else []
+    with csv_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    payload = {
+        'dataset': dataset,
+        'models': models,
+        'compressors': compressors,
+        'rows': rows,
+    }
+    with json_path.open('w', encoding='utf-8') as f:
+        json.dump(_json_clean(payload), f, indent=2)
+
+    print(f"  [compare] saved table {csv_path}")
+    print(f"  [compare] saved data  {json_path}")
+
+    script = r"""
+import json, sys
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+p = json.loads(sys.argv[1])
+rows = p['rows']
+fig, ax = plt.subplots(figsize=(9.2, 5.2))
+for model in p['models']:
+    for comp in p['compressors']:
+        pts = [r for r in rows if r['model'] == model and r['compressor'] == comp]
+        pts = [r for r in pts if r['compression'] is not None and r['test_acc_mean'] is not None]
+        pts.sort(key=lambda r: r['compression'])
+        if not pts:
+            continue
+        label = comp if len(p['models']) == 1 else f"{model}/{comp}"
+        ax.plot([r['compression'] for r in pts],
+                [r['test_acc_mean'] for r in pts],
+                marker='o', label=label)
+ax.set_xlabel('Actual node compression (x)')
+ax.set_ylabel('Test accuracy')
+ax.grid(True, alpha=0.25)
+ax.legend(loc='best', fontsize=8)
+fig.suptitle(f"{p['dataset']} compressor comparison")
+fig.tight_layout()
+fig.savefig(p['out'], dpi=180)
+plt.close(fig)
+"""
+    plot_payload = _json_clean({
+        'dataset': dataset,
+        'models': models,
+        'compressors': compressors,
+        'rows': rows,
+        'out': str(png_path),
+    })
+    try:
+        subprocess.run(
+            [sys.executable, '-c', script, json.dumps(plot_payload)],
+            check=True, capture_output=True, text=True)
+    except Exception as exc:
+        print(f"  [compare] PNG skipped: matplotlib is unavailable or failed ({exc})")
+        return csv_path
+
+    print(f"  [compare] saved plot  {png_path}")
+    return png_path
+
+
+def _json_clean(obj):
+    if isinstance(obj, dict):
+        return {k: _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_clean(v) for v in obj]
+    if isinstance(obj, float) and np.isnan(obj):
+        return None
+    return obj
+
+
 # ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧
 # CLI
 # ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧
@@ -343,6 +507,15 @@ def main():
                         default=[0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1],
                         metavar='R',
                         help='Retention ratios to sweep (high -low)')
+    parser.add_argument('--compressor', default='hcgc',
+                        choices=list(_COMPRESSORS),
+                        help='Compression method to sweep.')
+    parser.add_argument('--compressors', nargs='+', choices=list(_COMPRESSORS),
+                        metavar='C',
+                        help='One or more compression methods to compare. '
+                             'Overrides --compressor.')
+    parser.add_argument('--all-compressors', action='store_true',
+                        help='Run all available compression methods in one job.')
     parser.add_argument('--runs',     type=int, default=3,
                         help='Timed runs per ratio')
     parser.add_argument('--warmup',   type=int, default=1,
@@ -383,49 +556,36 @@ def main():
 
     ratios   = sorted(args.ratios, reverse=True)   # high -low (less -more compressed)
     models   = args.models if args.models else [args.model]
+    if args.all_compressors:
+        compressors = list(_COMPRESSORS)
+    elif args.compressors:
+        compressors = args.compressors
+    else:
+        compressors = [args.compressor]
     do_base  = not args.no_baseline
 
-    if len(models) == 1:
-        # ?? Single-model path (original behaviour) ????????????????????????????
-        base_stats, sweep = run_sweep(
-            dataset         = args.dataset,
-            ratios          = ratios,
-            runs            = args.runs,
-            warmup          = args.warmup,
-            device          = args.device,
-            root            = args.root,
-            pretrain        = not args.no_pretrain,
-            train_epochs    = args.train_epochs,
-            train_hidden    = args.train_hidden,
-            mini_batch_size = args.mini_batch_size,
-            model_name      = models[0],
-            baseline        = do_base,
-            emb_method      = args.emb_method,
-            coarsen_l2_normalize = not args.raw_no_l2,
-            relprop_hops    = args.relprop_hops,
-            relprop_outdim  = args.relprop_outdim,
-            type_thresholds = args.type_thresholds,
-            metapath_thresholds = args.metapath_thresholds,
-            edge_weight_mode = args.edge_weight_mode,
-        )
-        print_sweep_table(base_stats, sweep, args.dataset)
-        save_sweep_plot(sweep, args.dataset, models[0], args.plot_dir)
+    all_results = {}      # (model_name, compressor) -> (base_stats, sweep)
+    baseline_by_model = {}
+    combo_idx = 0
+    total_combos = len(models) * len(compressors)
 
-    else:
-        # ?? Multi-model path ??????????????????????????????????????????????????
-        # Collect results per model, then print a cross-model summary table.
-        # Baseline is measured ONCE per model (it also depends on the model arch).
-        all_results = {}   # model_name -> (base_stats, sweep)
+    for mname in models:
+        for compressor in compressors:
+            combo_idx += 1
+            print(f"\n{'#'*72}")
+            print(f"  Job {combo_idx}/{total_combos}: model={mname}  "
+                  f"compressor={compressor}")
+            print(f"{'#'*72}")
 
-        for mi, mname in enumerate(models):
-            print(f"\n{'#'*68}")
-            print(f"  Model {mi+1}/{len(models)}: {mname.upper()}")
-            print(f"{'#'*68}")
+            base_override = baseline_by_model.get(mname)
+            run_baseline_now = do_base and base_override is None
+            warmup_now = args.warmup if combo_idx == 1 else 0
+
             base_stats, sweep = run_sweep(
                 dataset         = args.dataset,
                 ratios          = ratios,
                 runs            = args.runs,
-                warmup          = args.warmup if mi == 0 else 0,  # warmup once
+                warmup          = warmup_now,
                 device          = args.device,
                 root            = args.root,
                 pretrain        = not args.no_pretrain,
@@ -433,7 +593,8 @@ def main():
                 train_hidden    = args.train_hidden,
                 mini_batch_size = args.mini_batch_size,
                 model_name      = mname,
-                baseline        = do_base,
+                baseline        = run_baseline_now,
+                baseline_stats  = base_override,
                 emb_method      = args.emb_method,
                 coarsen_l2_normalize = not args.raw_no_l2,
                 relprop_hops    = args.relprop_hops,
@@ -441,46 +602,18 @@ def main():
                 type_thresholds = args.type_thresholds,
                 metapath_thresholds = args.metapath_thresholds,
                 edge_weight_mode = args.edge_weight_mode,
+                compressor      = compressor,
             )
+            if do_base and mname not in baseline_by_model:
+                baseline_by_model[mname] = base_stats
             print_sweep_table(base_stats, sweep, args.dataset)
-            save_sweep_plot(sweep, args.dataset, mname, args.plot_dir)
-            all_results[mname] = (base_stats, sweep)
+            save_sweep_plot(sweep, args.dataset, mname, args.plot_dir,
+                            compressor)
+            all_results[(mname, compressor)] = (base_stats, sweep)
 
-        # ?? Cross-model summary ???????????????????????????????????????????????
-        W = 72
-        print(f"\n{'='*W}")
-        print(f"  MULTI-MODEL SUMMARY   dataset={args.dataset}   ratios={ratios}")
-        print(f"{'='*W}")
-
-        # Header row: model names
-        ratio_col_w = 8
-        model_col_w = 18
-        header = f"  {'ratio':>{ratio_col_w}}"
-        for mname in models:
-            header += f"  {mname.upper():^{model_col_w}}"
-        print(header)
-
-        # Baseline row
-        bline_row = f"  {'baseline':>{ratio_col_w}}"
-        for mname in models:
-            bs, _ = all_results[mname]
-            if bs is not None:
-                bline_row += f"  {bs['acc_mean']:6.4f}+/-{bs['acc_std']:.4f}  "
-            else:
-                bline_row += f"  {'n/a':^{model_col_w}}"
-        print(bline_row)
-        print("  " + "-" * (ratio_col_w + 2 + (model_col_w + 2) * len(models)))
-
-        # One row per ratio
-        for ri, ratio in enumerate(ratios):
-            row = f"  {ratio:>{ratio_col_w}.2f}"
-            for mname in models:
-                _, sweep = all_results[mname]
-                entry = sweep[ri]
-                row += f"  {entry['acc_mean']:6.4f}+/-{entry['acc_std']:.4f}  "
-            print(row)
-
-        print(f"{'='*W}\n")
+    print_compressor_table(all_results, args.dataset, models, compressors)
+    save_comparison_outputs(all_results, args.dataset, models, compressors,
+                            args.plot_dir)
 
 
 if __name__ == '__main__':

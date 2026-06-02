@@ -37,6 +37,15 @@ except ImportError:
         return it
 
 import hcgc
+from hcgc._baselines import compress_ahugc_style, compress_random_type
+
+
+_COMPRESSORS = {
+    'hcgc': 'HCGC',
+    'cgc_type': 'CGC-type adaptation',
+    'random_type': 'Random type-isolated',
+    'ahugc_style': 'AH-UGC-style hash',
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1423,37 +1432,64 @@ def run_once(data, target_type, ratio, device, pretrain,
              use_soft_labels=False, eval_protocol='original',
              pairwise_merge=False, type_thresholds=False,
              metapath_thresholds=False, edge_weight_mode='binary',
-             freeze_node_types=None):
+             freeze_node_types=None, compressor='hcgc'):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
     train_patience=None (default): run all train_epochs, no early stopping.
     """
     # ── Compression ───────────────────────────────────────────────────────────
+    compressor = str(compressor or 'hcgc').lower()
+    if compressor not in _COMPRESSORS:
+        raise ValueError(f"Unknown compressor={compressor!r}; "
+                         f"choices={list(_COMPRESSORS)}")
+
     t0 = time.perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        result = hcgc.compress(
-            data,
-            ratio           = ratio,
-            target_type     = target_type,
-            pretrain        = pretrain,
-            pretrain_epochs = pretrain_epochs,
-            pretrain_patience = pretrain_patience,
-            emb_method      = emb_method,
-            coarsen_l2_normalize = coarsen_l2_normalize,
-            relprop_hops    = relprop_hops,
-            relprop_outdim  = relprop_outdim,
-            device          = device,
-            verbose         = verbose,
-            mini_batch_size = mini_batch_size,
-            use_soft_labels = use_soft_labels,
-            pairwise_merge  = pairwise_merge,
-            type_thresholds = type_thresholds,
-            metapath_thresholds = metapath_thresholds,
-            edge_weight_mode = edge_weight_mode,
-            freeze_node_types = freeze_node_types,
-        )
+        if compressor == 'random_type':
+            result = compress_random_type(
+                data,
+                ratio=ratio,
+                target_type=target_type,
+                edge_weight_mode=edge_weight_mode,
+                use_soft_labels=use_soft_labels,
+                freeze_node_types=freeze_node_types,
+                verbose=verbose,
+            )
+        elif compressor == 'ahugc_style':
+            result = compress_ahugc_style(
+                data,
+                ratio=ratio,
+                target_type=target_type,
+                edge_weight_mode=edge_weight_mode,
+                use_soft_labels=use_soft_labels,
+                freeze_node_types=freeze_node_types,
+                verbose=verbose,
+            )
+        else:
+            result = hcgc.compress(
+                data,
+                ratio           = ratio,
+                target_type     = target_type,
+                pretrain        = pretrain,
+                pretrain_epochs = pretrain_epochs,
+                pretrain_patience = pretrain_patience,
+                emb_method      = emb_method,
+                coarsen_l2_normalize = coarsen_l2_normalize,
+                relprop_hops    = relprop_hops,
+                relprop_outdim  = relprop_outdim,
+                device          = device,
+                verbose         = verbose,
+                mini_batch_size = mini_batch_size,
+                use_soft_labels = use_soft_labels,
+                pairwise_merge  = pairwise_merge or compressor == 'cgc_type',
+                type_thresholds = False if compressor == 'cgc_type' else type_thresholds,
+                metapath_thresholds = (
+                    False if compressor == 'cgc_type' else metapath_thresholds),
+                edge_weight_mode = edge_weight_mode,
+                freeze_node_types = freeze_node_types,
+            )
     t_compress = time.perf_counter() - t0
     oracle = oracle_upper_bound(result, data, target_type, 'test_mask')
     oracle_val = oracle_upper_bound(result, data, target_type, 'val_mask')
@@ -1498,6 +1534,7 @@ def run_once(data, target_type, ratio, device, pretrain,
         'oracle_mean_purity': oracle['oracle_mean_purity'],
         'target_emb_distortion': result.info.get('target_emb_distortion', float('nan')),
         'target_emb_cosine': result.info.get('target_emb_cosine', float('nan')),
+        'compressor': compressor,
         'n_nodes_orig': n_orig,
         'n_nodes_comp': n_comp,
         'edges_orig':   e_orig,
@@ -1522,6 +1559,11 @@ def main():
                         help='Dataset to benchmark')
     parser.add_argument('--ratio',    type=float, default=0.1,
                         help='Node retention ratio  (0.1 = keep 10%% = 10x target)')
+    parser.add_argument('--compressor', default='hcgc',
+                        choices=list(_COMPRESSORS),
+                        help='Compression method to evaluate. ahugc_style and '
+                             'random_type are fast type-isolated baselines; '
+                             'cgc_type is a CGC-like one-by-one adaptation.')
     parser.add_argument('--runs',     type=int,   default=3,
                         help='Number of timed measurement runs')
     parser.add_argument('--warmup',   type=int,   default=1,
@@ -1610,6 +1652,7 @@ def main():
     print(f"{'='*W}")
     print(f"  dataset  : {args.dataset}")
     print(f"  ratio    : {args.ratio}  ({1/args.ratio:.1f}x target compression)")
+    print(f"  compressor: {args.compressor} ({_COMPRESSORS[args.compressor]})")
     print(f"  model    : {args.model}")
     print(f"  pretrain : {pretrain}")
     print(f"  emb      : {args.emb_method if pretrain else 'raw'}")
@@ -1620,7 +1663,8 @@ def main():
     print(f"  soft_y   : {args.soft_labels}")
     print(f"  edge_w   : {args.edge_weight_mode}")
     print(f"  freeze   : {args.freeze_node_types or 'none'}")
-    print(f"  merge    : {'pairwise' if args.pairwise_merge else 'ball-multi'}")
+    _merge_mode = 'pairwise' if args.pairwise_merge or args.compressor == 'cgc_type' else 'ball-multi'
+    print(f"  merge    : {_merge_mode}")
     _thresh_mode = ('metapath-auto' if args.metapath_thresholds
                     else 'type-auto' if args.type_thresholds else 'global')
     print(f"  thresh   : {_thresh_mode}")
@@ -1689,7 +1733,8 @@ def main():
                      coarsen_l2_normalize=not args.raw_no_l2,
                      relprop_hops=args.relprop_hops,
                      relprop_outdim=args.relprop_outdim,
-                     freeze_node_types=args.freeze_node_types)
+                     freeze_node_types=args.freeze_node_types,
+                     compressor=args.compressor)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
@@ -1711,7 +1756,8 @@ def main():
                      coarsen_l2_normalize=not args.raw_no_l2,
                      relprop_hops=args.relprop_hops,
                      relprop_outdim=args.relprop_outdim,
-                     freeze_node_types=args.freeze_node_types)
+                     freeze_node_types=args.freeze_node_types,
+                     compressor=args.compressor)
             print(f"  warmup {i+1}/{args.warmup} "
                   f"[pretrain={pretrain}, emb={args.emb_method if pretrain else 'raw'}]  "
                   f"({time.perf_counter()-t_wu:.1f}s)")
@@ -1746,6 +1792,7 @@ def main():
             relprop_hops     = args.relprop_hops,
             relprop_outdim   = args.relprop_outdim,
             freeze_node_types = args.freeze_node_types,
+            compressor       = args.compressor,
         )
         records.append(r)
         print(
@@ -1759,6 +1806,8 @@ def main():
     # ── Summary table ─────────────────────────────────────────────────────────
     def stat(key):
         vals = np.array([r[key] for r in records], dtype=float)
+        if np.isnan(vals).all():
+            return float('nan'), float('nan')
         return float(np.nanmean(vals)), float(np.nanstd(vals))
 
     r0 = records[0]
@@ -1784,8 +1833,10 @@ def main():
     ed_m, ed_s = stat('target_emb_distortion')
     ec_m, ec_s = stat('target_emb_cosine')
 
+    comp_label = _COMPRESSORS[args.compressor]
+
     print(f"\n{'='*W}")
-    print(f"  RESULTS   dataset={args.dataset}  "
+    print(f"  RESULTS   dataset={args.dataset}  compressor={args.compressor}  "
           f"target_ratio={args.ratio} ({1/args.ratio:.0f}x)  ({args.runs} runs)")
     print(f"{'='*W}")
     print(f"  {'Nodes':<28}: {r0['n_nodes_orig']:>10,}  ->  {r0['n_nodes_comp']:>8,}")
@@ -1824,9 +1875,9 @@ def main():
 
         print()
         print(f"  {'─'*58}")
-        print(f"  {'Baseline vs HCGC comparison':^58}")
+        print(f"  {('Baseline vs ' + comp_label):^58}")
         print(f"  {'─'*58}")
-        print(f"  {'':28}  {'Baseline':>10}  {'HCGC':>10}")
+        print(f"  {'':28}  {'Baseline':>10}  {args.compressor:>10}")
         print(f"  {'Train time':<28}  {b_t_m:>9.1f}s  {tt_m:>9.1f}s"
               f"  ({train_speedup:.1f}x faster)")
         print(f"  {'Total time (incl. compress)':<28}  {b_t_m:>9.1f}s  {tot_m:>9.1f}s"
