@@ -332,9 +332,15 @@ def load_aminer(root):
         src_t, _, dst_t = et
         if src_t == 'author' and dst_t == 'paper':
             a_old, p_old = _orient_edge_rows(et)
+            valid = (a_old < labeled_mask.numel()) & (p_old < paper_keep.numel())
+            a_old = a_old[valid]
+            p_old = p_old[valid]
             paper_keep[p_old[labeled_mask[a_old]]] = True
         if src_t == 'paper' and dst_t == 'author':
             p_old, a_old = _orient_edge_rows(et)
+            valid = (a_old < labeled_mask.numel()) & (p_old < paper_keep.numel())
+            a_old = a_old[valid]
+            p_old = p_old[valid]
             paper_keep[p_old[labeled_mask[a_old]]] = True
 
     paper_ids   = paper_keep.nonzero(as_tuple=True)[0]
@@ -347,9 +353,15 @@ def load_aminer(root):
         src_t, _, dst_t = et
         if src_t == 'paper' and dst_t == 'venue':
             p_old, v_old = _orient_edge_rows(et)
+            valid = (p_old < paper_keep.numel()) & (v_old < venue_keep.numel())
+            p_old = p_old[valid]
+            v_old = v_old[valid]
             venue_keep[v_old[paper_keep[p_old]]] = True
         if src_t == 'venue' and dst_t == 'paper':
             v_old, p_old = _orient_edge_rows(et)
+            valid = (p_old < paper_keep.numel()) & (v_old < venue_keep.numel())
+            p_old = p_old[valid]
+            v_old = v_old[valid]
             venue_keep[v_old[paper_keep[p_old]]] = True
 
     venue_ids  = venue_keep.nonzero(as_tuple=True)[0]
@@ -376,6 +388,10 @@ def load_aminer(root):
         if src_t not in old2new or dst_t not in old2new:
             continue
         src_old, dst_old = _orient_edge_rows(et)
+        valid = ((src_old < old2new[src_t].numel())
+                 & (dst_old < old2new[dst_t].numel()))
+        src_old = src_old[valid]
+        dst_old = dst_old[valid]
         src_new = old2new[src_t][src_old]
         dst_new = old2new[dst_t][dst_old]
         keep    = (src_new >= 0) & (dst_new >= 0)
