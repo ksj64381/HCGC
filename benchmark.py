@@ -303,16 +303,39 @@ def load_aminer(root):
     labeled_ids  = labeled_mask.nonzero(as_tuple=True)[0]   # old → kept
     a_old2new    = torch.full((full[target].num_nodes,), -1, dtype=torch.long)
     a_old2new[labeled_ids] = torch.arange(len(labeled_ids))
+    full_num_nodes = {
+        nt: int(full[nt].num_nodes)
+        for nt in ['author', 'paper', 'venue']
+        if nt in full.node_types
+    }
+
+    def _row_fits(row, nt):
+        return row.numel() == 0 or int(row.max().item()) < full_num_nodes[nt]
+
+    def _orient_edge_rows(et):
+        src_t, _, dst_t = et
+        ei = full[et].edge_index
+        if _row_fits(ei[0], src_t) and _row_fits(ei[1], dst_t):
+            return ei[0], ei[1]
+        if _row_fits(ei[1], src_t) and _row_fits(ei[0], dst_t):
+            return ei[1], ei[0]
+        raise RuntimeError(
+            f"AMiner edge_index for {et} does not match declared node sizes: "
+            f"row0 max={int(ei[0].max().item())}, "
+            f"row1 max={int(ei[1].max().item())}, "
+            f"sizes=({src_t}:{full_num_nodes[src_t]}, "
+            f"{dst_t}:{full_num_nodes[dst_t]})")
 
     # ── Step 2: collect papers linked to labeled authors ──────────────────
     paper_keep = torch.zeros(full['paper'].num_nodes, dtype=torch.bool)
     for et in full.edge_types:
         src_t, _, dst_t = et
-        ei = full[et].edge_index
         if src_t == 'author' and dst_t == 'paper':
-            paper_keep[ei[1, labeled_mask[ei[0]]]] = True
+            a_old, p_old = _orient_edge_rows(et)
+            paper_keep[p_old[labeled_mask[a_old]]] = True
         if src_t == 'paper' and dst_t == 'author':
-            paper_keep[ei[0, labeled_mask[ei[1]]]] = True
+            p_old, a_old = _orient_edge_rows(et)
+            paper_keep[p_old[labeled_mask[a_old]]] = True
 
     paper_ids   = paper_keep.nonzero(as_tuple=True)[0]
     p_old2new   = torch.full((full['paper'].num_nodes,), -1, dtype=torch.long)
@@ -322,11 +345,12 @@ def load_aminer(root):
     venue_keep = torch.zeros(full['venue'].num_nodes, dtype=torch.bool)
     for et in full.edge_types:
         src_t, _, dst_t = et
-        ei = full[et].edge_index
         if src_t == 'paper' and dst_t == 'venue':
-            venue_keep[ei[1, paper_keep[ei[0]]]] = True
+            p_old, v_old = _orient_edge_rows(et)
+            venue_keep[v_old[paper_keep[p_old]]] = True
         if src_t == 'venue' and dst_t == 'paper':
-            venue_keep[ei[0, paper_keep[ei[1]]]] = True
+            v_old, p_old = _orient_edge_rows(et)
+            venue_keep[v_old[paper_keep[p_old]]] = True
 
     venue_ids  = venue_keep.nonzero(as_tuple=True)[0]
     v_old2new  = torch.full((full['venue'].num_nodes,), -1, dtype=torch.long)
@@ -351,9 +375,9 @@ def load_aminer(root):
         src_t, rel, dst_t = et
         if src_t not in old2new or dst_t not in old2new:
             continue
-        ei  = full[et].edge_index
-        src_new = old2new[src_t][ei[0]]
-        dst_new = old2new[dst_t][ei[1]]
+        src_old, dst_old = _orient_edge_rows(et)
+        src_new = old2new[src_t][src_old]
+        dst_new = old2new[dst_t][dst_old]
         keep    = (src_new >= 0) & (dst_new >= 0)
         if keep.any():
             data[et].edge_index = torch.stack(
