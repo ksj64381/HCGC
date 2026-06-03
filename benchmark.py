@@ -1432,7 +1432,9 @@ def run_once(data, target_type, ratio, device, pretrain,
              use_soft_labels=False, eval_protocol='original',
              pairwise_merge=False, type_thresholds=False,
              metapath_thresholds=False, edge_weight_mode='binary',
-             freeze_node_types=None, compressor='hcgc'):
+             freeze_node_types=None, compressor='hcgc',
+             ratio_search='fast', auto_search_runs=8,
+             auto_target_tolerance=None):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
@@ -1489,6 +1491,9 @@ def run_once(data, target_type, ratio, device, pretrain,
                     False if compressor == 'cgc_type' else metapath_thresholds),
                 edge_weight_mode = edge_weight_mode,
                 freeze_node_types = freeze_node_types,
+                ratio_search = ratio_search,
+                auto_search_runs = auto_search_runs,
+                auto_target_tolerance = auto_target_tolerance,
             )
     t_compress = time.perf_counter() - t0
     oracle = oracle_upper_bound(result, data, target_type, 'test_mask')
@@ -1535,6 +1540,7 @@ def run_once(data, target_type, ratio, device, pretrain,
         'target_emb_distortion': result.info.get('target_emb_distortion', float('nan')),
         'target_emb_cosine': result.info.get('target_emb_cosine', float('nan')),
         'compressor': compressor,
+        'ratio_search': ratio_search,
         'n_nodes_orig': n_orig,
         'n_nodes_comp': n_comp,
         'edges_orig':   e_orig,
@@ -1564,6 +1570,16 @@ def main():
                         help='Compression method to evaluate. ahugc_style and '
                              'random_type are fast type-isolated baselines; '
                              'cgc_type is a CGC-like one-by-one adaptation.')
+    parser.add_argument('--ratio-search', default='fast',
+                        choices=['fast', 'precise'],
+                        help='Target-ratio search mode for hcgc/cgc_type. '
+                             'fast uses one-shot scale prediction; precise '
+                             'uses bracket + log-space interpolation.')
+    parser.add_argument('--auto-search-runs', type=int, default=8,
+                        help='Max interpolation runs for --ratio-search precise.')
+    parser.add_argument('--auto-target-tolerance', type=float, default=None,
+                        help='Relative compression error tolerance. Default: '
+                             '0.05 for precise, 0.15 for fast.')
     parser.add_argument('--runs',     type=int,   default=3,
                         help='Number of timed measurement runs')
     parser.add_argument('--warmup',   type=int,   default=1,
@@ -1653,6 +1669,7 @@ def main():
     print(f"  dataset  : {args.dataset}")
     print(f"  ratio    : {args.ratio}  ({1/args.ratio:.1f}x target compression)")
     print(f"  compressor: {args.compressor} ({_COMPRESSORS[args.compressor]})")
+    print(f"  search   : {args.ratio_search}")
     print(f"  model    : {args.model}")
     print(f"  pretrain : {pretrain}")
     print(f"  emb      : {args.emb_method if pretrain else 'raw'}")
@@ -1734,7 +1751,10 @@ def main():
                      relprop_hops=args.relprop_hops,
                      relprop_outdim=args.relprop_outdim,
                      freeze_node_types=args.freeze_node_types,
-                     compressor=args.compressor)
+                     compressor=args.compressor,
+                     ratio_search=args.ratio_search,
+                     auto_search_runs=args.auto_search_runs,
+                     auto_target_tolerance=args.auto_target_tolerance)
             print(f"  warmup {i+1}/{args.warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             # Pass 2: GNN pretrain code path (same config as timed runs)
             t_wu = time.perf_counter()
@@ -1757,7 +1777,10 @@ def main():
                      relprop_hops=args.relprop_hops,
                      relprop_outdim=args.relprop_outdim,
                      freeze_node_types=args.freeze_node_types,
-                     compressor=args.compressor)
+                     compressor=args.compressor,
+                     ratio_search=args.ratio_search,
+                     auto_search_runs=args.auto_search_runs,
+                     auto_target_tolerance=args.auto_target_tolerance)
             print(f"  warmup {i+1}/{args.warmup} "
                   f"[pretrain={pretrain}, emb={args.emb_method if pretrain else 'raw'}]  "
                   f"({time.perf_counter()-t_wu:.1f}s)")
@@ -1793,6 +1816,9 @@ def main():
             relprop_outdim   = args.relprop_outdim,
             freeze_node_types = args.freeze_node_types,
             compressor       = args.compressor,
+            ratio_search     = args.ratio_search,
+            auto_search_runs  = args.auto_search_runs,
+            auto_target_tolerance = args.auto_target_tolerance,
         )
         records.append(r)
         print(

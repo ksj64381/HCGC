@@ -47,6 +47,9 @@ def compress(
     metapath_thresholds = False,
     edge_weight_mode = 'binary',
     freeze_node_types = None,
+    ratio_search = 'fast',
+    auto_search_runs = 8,
+    auto_target_tolerance = None,
 ) -> HCGCResult:
     """Compress a heterogeneous graph using HCGC.
 
@@ -134,6 +137,12 @@ def compress(
     from hcgc._coarsen import build_compressed_data
 
     # ── Device setup ──────────────────────────────────────────────────────────
+    ratio_search = str(ratio_search or 'fast').lower()
+    if ratio_search not in {'fast', 'precise'}:
+        raise ValueError("ratio_search must be one of {'fast', 'precise'}")
+    if auto_target_tolerance is None:
+        auto_target_tolerance = 0.05 if ratio_search == 'precise' else 0.15
+
     if device == 'auto':
         dev_str = 'cuda' if torch.cuda.is_available() else 'cpu'
     else:
@@ -177,7 +186,10 @@ def compress(
                        use_soft_labels=use_soft_labels,
                        pairwise_merge=pairwise_merge,
                        type_thresholds=type_thresholds,
-                       metapath_thresholds=metapath_thresholds)
+                       metapath_thresholds=metapath_thresholds,
+                       ratio_search=ratio_search,
+                       auto_search_runs=auto_search_runs,
+                       auto_target_tolerance=auto_target_tolerance)
 
     # ── Pretrain (or fast-embed) + extract flat arrays ────────────────────────
     _t = time.perf_counter()
@@ -224,6 +236,9 @@ def compress(
         'edges_comp':   stats['edges_comp'],
         'edge_ratio':   round(stats['edge_ratio'], 4),
         'freeze_node_types': list(freeze_node_types or []),
+        'ratio_search': ratio_search,
+        'auto_search_runs': int(auto_search_runs),
+        'auto_target_tolerance': float(auto_target_tolerance),
         'target_emb_distortion': emb_diag['distortion'],
         'target_emb_cosine': emb_diag['cosine'],
     }
@@ -373,7 +388,10 @@ def _build_args(ratio, pretrain, pretrain_epochs,
                 use_soft_labels=False,
                 pairwise_merge=False,
                 type_thresholds=False,
-                metapath_thresholds=False):
+                metapath_thresholds=False,
+                ratio_search='fast',
+                auto_search_runs=8,
+                auto_target_tolerance=0.15):
     """Build default args namespace for compress()."""
     return types.SimpleNamespace(
         # Coarsening
@@ -381,7 +399,9 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         use_auto_coarsen            = True,
         target_ratio                = ratio,
         max_acc_loss                = 0.1,
-        use_fast_scale              = True,
+        use_fast_scale              = (str(ratio_search).lower() != 'precise'),
+        auto_search_runs            = int(auto_search_runs),
+        auto_target_tolerance       = float(auto_target_tolerance),
         coarsen_pca_dim             = 0,
         coarsen_l2_normalize        = coarsen_l2_normalize,
         # HCGC kernel params

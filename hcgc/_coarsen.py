@@ -989,7 +989,7 @@ def _run_coarsen_cheap(ctx, args, scale):
 
 def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
                  max_search_runs=8, verbose=True, fast_scale=False,
-                 run_probe=True):
+                 run_probe=True, target_tolerance=0.15):
     """Find the optimal HCGC scale in a small number of coarsening runs.
 
     Args:
@@ -1003,7 +1003,7 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
       hi_scale gives comp >= target.
 
     Phase 2 - Geometric binary search  (up to max_search_runs more runs):
-      Bisect in log-scale space until compression is within 15% of target.
+      Bisect in log-scale space until compression is within target_tolerance.
 
     Fast-scale mode  (fast_scale=True)
     -----------------------------------
@@ -1012,6 +1012,7 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
     Typically 2-3 total runs vs 5-9 for bracket+binary.
     """
     target_compression = 1.0 / max(float(target_ratio), 1e-6)
+    target_tolerance = float(target_tolerance)
 
     if verbose:
         print("\n" + "=" * 60)
@@ -1369,7 +1370,7 @@ def auto_coarsen(ctx, args, target_ratio=0.2, max_acc_loss=0.05,
         _record(mid_scale, cm_m, comp_m, t_m)
 
         rel_err = abs(comp_m - target_compression) / max(target_compression, 1)
-        if rel_err < 0.15:
+        if rel_err < target_tolerance:
             best_cm, best_comp, best_t = cm_m, comp_m, t_m
             if verbose:
                 print(f"  [AutoCoarsen] Close enough ({rel_err*100:.1f}% error). "

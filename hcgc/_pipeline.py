@@ -235,8 +235,10 @@ def _coarsen_from_context(ctx, args):
             ctx, args,
             target_ratio=args.target_ratio,
             max_acc_loss=getattr(args, 'max_acc_loss', 0.05),
+            max_search_runs=getattr(args, 'auto_search_runs', 8),
             fast_scale=getattr(args, 'use_fast_scale', False),
             run_probe=getattr(args, 'run_probe', True),
+            target_tolerance=getattr(args, 'auto_target_tolerance', 0.15),
         )
         t_c = time.perf_counter() - _t_auto  # total search time, not just one run
     else:

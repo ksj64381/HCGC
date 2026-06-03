@@ -46,7 +46,9 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
               emb_method='gnn', coarsen_l2_normalize=True,
               relprop_hops=2, relprop_outdim=128,
               type_thresholds=False, metapath_thresholds=False,
-              edge_weight_mode='binary', compressor='hcgc'):
+              edge_weight_mode='binary', compressor='hcgc',
+              ratio_search='fast', auto_search_runs=8,
+              auto_target_tolerance=None):
     """Run compress?뭪rain for each ratio and return collected stats.
 
     Returns
@@ -61,6 +63,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     print(f"  dataset  : {dataset}")
     print(f"  ratios   : {ratios}")
     print(f"  compressor: {compressor} ({_COMPRESSORS[compressor]})")
+    print(f"  search   : {ratio_search}")
     print(f"  model    : {model_name}")
     print(f"  pretrain : {pretrain}")
     print(f"  emb      : {emb_method if pretrain else 'raw'}")
@@ -126,7 +129,10 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      type_thresholds=type_thresholds,
                      metapath_thresholds=metapath_thresholds,
                      edge_weight_mode=edge_weight_mode,
-                     compressor=compressor)
+                     compressor=compressor,
+                     ratio_search=ratio_search,
+                     auto_search_runs=auto_search_runs,
+                     auto_target_tolerance=auto_target_tolerance)
             print(f"  warmup {i+1}/{warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
@@ -140,7 +146,10 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      type_thresholds=type_thresholds,
                      metapath_thresholds=metapath_thresholds,
                      edge_weight_mode=edge_weight_mode,
-                     compressor=compressor)
+                     compressor=compressor,
+                     ratio_search=ratio_search,
+                     auto_search_runs=auto_search_runs,
+                     auto_target_tolerance=auto_target_tolerance)
             print(f"  warmup {i+1}/{warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ?? Ratio sweep ???????????????????????????????????????????????????????????
@@ -168,6 +177,9 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                 metapath_thresholds = metapath_thresholds,
                 edge_weight_mode = edge_weight_mode,
                 compressor      = compressor,
+                ratio_search    = ratio_search,
+                auto_search_runs = auto_search_runs,
+                auto_target_tolerance = auto_target_tolerance,
             )
             recs.append(r)
             print(f"comp={r['compression']:.2f}x  "
@@ -261,7 +273,8 @@ def print_sweep_table(base_stats, sweep, dataset):
     print(f"{'='*W}\n")
 
 
-def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc'):
+def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc',
+                    ratio_search='fast'):
     if not plot_dir:
         return None
     import json
@@ -270,7 +283,7 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc'):
 
     out_dir = Path(plot_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"proxy_sweep_{dataset}_{model_name}_{compressor}"
+    stem = f"proxy_sweep_{dataset}_{model_name}_{compressor}_{ratio_search}"
     out_path = out_dir / f"{stem}.png"
     json_path = out_dir / f"{stem}.json"
     csv_path = out_dir / f"{stem}.csv"
@@ -288,7 +301,8 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc'):
         'val_oracle': arr('val_oracle_mean').tolist(),
         'test_oracle': arr('oracle_mean').tolist(),
         'emb_dist': arr('emb_dist_mean').tolist(),
-        'title': f'{dataset} {model_name} {compressor} compression proxy sweep',
+        'title': (f'{dataset} {model_name} {compressor} '
+                  f'{ratio_search} compression proxy sweep'),
         'out': str(out_path),
     }
     with json_path.open('w', encoding='utf-8') as f:
@@ -366,7 +380,7 @@ def print_compressor_table(all_results, dataset, models, compressors):
 
 
 def save_comparison_outputs(all_results, dataset, models, compressors,
-                            plot_dir):
+                            plot_dir, ratio_search='fast'):
     if not plot_dir:
         return None
     import csv
@@ -377,7 +391,7 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
     out_dir.mkdir(parents=True, exist_ok=True)
     model_tag = '-'.join(models)
     comp_tag = '-'.join(compressors)
-    stem = f"compressor_compare_{dataset}_{model_tag}_{comp_tag}"
+    stem = f"compressor_compare_{dataset}_{model_tag}_{comp_tag}_{ratio_search}"
     csv_path = out_dir / f"{stem}.csv"
     json_path = out_dir / f"{stem}.json"
     png_path = out_dir / f"{stem}.png"
@@ -391,6 +405,7 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
                     'dataset': dataset,
                     'model': model_name,
                     'compressor': compressor,
+                    'ratio_search': ratio_search,
                     'ratio': e['ratio'],
                     'compression': e['comp_mean'],
                     'test_acc_mean': e['acc_mean'],
@@ -426,6 +441,7 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
         'dataset': dataset,
         'models': models,
         'compressors': compressors,
+        'ratio_search': ratio_search,
         'rows': rows,
     }
     with json_path.open('w', encoding='utf-8') as f:
@@ -467,6 +483,7 @@ plt.close(fig)
         'dataset': dataset,
         'models': models,
         'compressors': compressors,
+        'ratio_search': ratio_search,
         'rows': rows,
         'out': str(png_path),
     })
@@ -516,6 +533,14 @@ def main():
                              'Overrides --compressor.')
     parser.add_argument('--all-compressors', action='store_true',
                         help='Run all available compression methods in one job.')
+    parser.add_argument('--ratio-search', default='fast',
+                        choices=['fast', 'precise'],
+                        help='Target-ratio search mode for hcgc/cgc_type.')
+    parser.add_argument('--auto-search-runs', type=int, default=8,
+                        help='Max interpolation runs for --ratio-search precise.')
+    parser.add_argument('--auto-target-tolerance', type=float, default=None,
+                        help='Relative compression error tolerance. Default: '
+                             '0.05 for precise, 0.15 for fast.')
     parser.add_argument('--runs',     type=int, default=3,
                         help='Timed runs per ratio')
     parser.add_argument('--warmup',   type=int, default=1,
@@ -603,17 +628,20 @@ def main():
                 metapath_thresholds = args.metapath_thresholds,
                 edge_weight_mode = args.edge_weight_mode,
                 compressor      = compressor,
+                ratio_search    = args.ratio_search,
+                auto_search_runs = args.auto_search_runs,
+                auto_target_tolerance = args.auto_target_tolerance,
             )
             if do_base and mname not in baseline_by_model:
                 baseline_by_model[mname] = base_stats
             print_sweep_table(base_stats, sweep, args.dataset)
             save_sweep_plot(sweep, args.dataset, mname, args.plot_dir,
-                            compressor)
+                            compressor, args.ratio_search)
             all_results[(mname, compressor)] = (base_stats, sweep)
 
     print_compressor_table(all_results, args.dataset, models, compressors)
     save_comparison_outputs(all_results, args.dataset, models, compressors,
-                            args.plot_dir)
+                            args.plot_dir, args.ratio_search)
 
 
 if __name__ == '__main__':
