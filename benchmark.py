@@ -72,6 +72,64 @@ def _add_degree_features(data):
     return data
 
 
+def _ensure_split_masks(data, target_type, train_ratio=0.6, val_ratio=0.2,
+                        seed=42):
+    """Create deterministic train/val/test masks when a dataset lacks them."""
+    nd = data[target_type]
+    if (getattr(nd, 'train_mask', None) is not None
+            and getattr(nd, 'val_mask', None) is not None
+            and getattr(nd, 'test_mask', None) is not None):
+        return data
+
+    if getattr(nd, 'y', None) is None:
+        raise RuntimeError(
+            f"{target_type!r} has no labels; cannot create split masks.")
+
+    y = nd.y
+    if y.dim() > 1:
+        y = y.squeeze()
+        nd.y = y
+
+    valid = (y >= 0).nonzero(as_tuple=True)[0]
+    n_valid = int(valid.numel())
+    if n_valid < 3:
+        raise RuntimeError(
+            f"{target_type!r} has too few labeled nodes ({n_valid}) "
+            "to create train/val/test masks.")
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    perm = valid[torch.randperm(n_valid, generator=gen)]
+
+    n_train = max(1, int(round(train_ratio * n_valid)))
+    n_val = max(1, int(round(val_ratio * n_valid)))
+    if n_train + n_val >= n_valid:
+        n_val = max(1, n_valid - n_train - 1)
+    n_test = n_valid - n_train - n_val
+    if n_test <= 0:
+        n_test = 1
+        n_train = max(1, n_valid - n_val - n_test)
+
+    train_idx = perm[:n_train]
+    val_idx = perm[n_train:n_train + n_val]
+    test_idx = perm[n_train + n_val:]
+
+    train_mask = torch.zeros(nd.num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(nd.num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(nd.num_nodes, dtype=torch.bool)
+    train_mask[train_idx] = True
+    val_mask[val_idx] = True
+    test_mask[test_idx] = True
+
+    nd.train_mask = train_mask
+    nd.val_mask = val_mask
+    nd.test_mask = test_mask
+    print(f"  [{target_type}] split masks absent - created "
+          f"{n_train:,}/{n_val:,}/{n_test:,} train/val/test masks "
+          f"(seed={seed})")
+    return data
+
+
 def load_imdb(root):
     from torch_geometric.datasets import IMDB
     data = IMDB(root=f'{root}/IMDB')[0]
@@ -87,6 +145,7 @@ def load_dblp(root):
 def load_lastfm(root):
     from torch_geometric.datasets import LastFM
     data = LastFM(root=f'{root}/LastFM')[0]
+    data = _ensure_split_masks(data, 'user')
     return data, 'user'
 
 
