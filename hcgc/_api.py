@@ -44,6 +44,7 @@ def compress(
     use_soft_labels = False,
     pairwise_merge  = True,
     merge_objective = 'ward',
+    skip_reassignment = False,
     type_thresholds = False,
     metapath_thresholds = False,
     edge_weight_mode = 'binary',
@@ -105,6 +106,10 @@ def compress(
                           the local mediator-induced projected Dirichlet
                           energy, with the existing threshold kept as a
                           similarity gate.
+        skip_reassignment
+                        : If True, disable the post-merge node reassignment
+                          heuristic. Useful for proof-faithful merge-only
+                          ablations.
         type_thresholds : If True, estimate per-source-type merge threshold
                           bases from mediator-pair energy samples, then use
                           one global multiplier for target-ratio control.
@@ -194,6 +199,7 @@ def compress(
                        use_soft_labels=use_soft_labels,
                        pairwise_merge=pairwise_merge,
                        merge_objective=merge_objective,
+                       skip_reassignment=skip_reassignment,
                        type_thresholds=type_thresholds,
                        metapath_thresholds=metapath_thresholds,
                        ratio_search=ratio_search,
@@ -397,6 +403,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
                 use_soft_labels=False,
                 pairwise_merge=True,
                 merge_objective='ward',
+                skip_reassignment=False,
                 type_thresholds=False,
                 metapath_thresholds=False,
                 ratio_search='fast',
@@ -422,7 +429,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         hcgc_feat_var_scale_by_src_med = None,
         hcgc_auto_type_thresholds   = type_thresholds,
         hcgc_auto_metapath_thresholds = metapath_thresholds,
-        hcgc_skip_reassignment      = False,
+        hcgc_skip_reassignment      = skip_reassignment,
         hcgc_window_size            = 20,
         hcgc_merge_cap_per_leader   = 1 if pairwise_merge else 0,
         hcgc_merge_objective         = merge_objective,

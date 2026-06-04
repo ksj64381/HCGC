@@ -1607,6 +1607,7 @@ def run_once(data, target_type, ratio, device, pretrain,
              pretrain_epochs=100, pretrain_patience=5,
              use_soft_labels=False, eval_protocol='original',
              pairwise_merge=True, merge_objective='ward',
+             skip_reassignment=False,
              type_thresholds=False,
              metapath_thresholds=False, edge_weight_mode='binary',
              freeze_node_types=None, compressor='hcgc',
@@ -1664,6 +1665,7 @@ def run_once(data, target_type, ratio, device, pretrain,
                 use_soft_labels = use_soft_labels,
                 pairwise_merge  = pairwise_merge or compressor == 'cgc_type',
                 merge_objective = merge_objective,
+                skip_reassignment = skip_reassignment,
                 type_thresholds = False if compressor == 'cgc_type' else type_thresholds,
                 metapath_thresholds = (
                     False if compressor == 'cgc_type' else metapath_thresholds),
@@ -1822,6 +1824,9 @@ def main():
                              'distortion; quotient_de accepts only merges that '
                              'decrease the local mediator-induced projected '
                              'Dirichlet energy.')
+    parser.add_argument('--skip-reassignment', action='store_true',
+                        help='Disable the post-merge reassignment heuristic. '
+                             'Useful for merge-only energy-descent ablations.')
     parser.add_argument('--type-thresholds', action='store_true',
                         help='Estimate per-source-type threshold bases from '
                              'mediator-pair energy samples, then search one global '
@@ -1872,6 +1877,7 @@ def main():
     _merge_mode = 'pairwise' if args.pairwise_merge or args.compressor == 'cgc_type' else 'ball-multi'
     print(f"  merge    : {_merge_mode}")
     print(f"  merge_obj: {args.merge_objective}")
+    print(f"  reassign : {not args.skip_reassignment}")
     _thresh_mode = ('metapath-auto' if args.metapath_thresholds
                     else 'type-auto' if args.type_thresholds else 'global')
     print(f"  thresh   : {_thresh_mode}")
@@ -1934,6 +1940,7 @@ def main():
                      use_soft_labels=args.soft_labels,
                      pairwise_merge=args.pairwise_merge,
                      merge_objective=args.merge_objective,
+                     skip_reassignment=args.skip_reassignment,
                      type_thresholds=args.type_thresholds,
                      metapath_thresholds=args.metapath_thresholds,
                      edge_weight_mode=args.edge_weight_mode,
@@ -1961,6 +1968,7 @@ def main():
                      use_soft_labels=args.soft_labels,
                      pairwise_merge=args.pairwise_merge,
                      merge_objective=args.merge_objective,
+                     skip_reassignment=args.skip_reassignment,
                      type_thresholds=args.type_thresholds,
                      metapath_thresholds=args.metapath_thresholds,
                      edge_weight_mode=args.edge_weight_mode,
@@ -2000,6 +2008,7 @@ def main():
             use_soft_labels  = args.soft_labels,
             pairwise_merge   = args.pairwise_merge,
             merge_objective  = args.merge_objective,
+            skip_reassignment = args.skip_reassignment,
             type_thresholds  = args.type_thresholds,
             metapath_thresholds = args.metapath_thresholds,
             edge_weight_mode = args.edge_weight_mode,
