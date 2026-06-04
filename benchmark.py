@@ -21,6 +21,7 @@ Usage
 """
 
 import argparse
+import os
 import sys
 import time
 import warnings
@@ -301,6 +302,17 @@ def load_aminer(root):
     # ── Step 1: keep only labeled authors (y >= 0) ────────────────────────
     labeled_mask = y_full >= 0
     labeled_ids  = labeled_mask.nonzero(as_tuple=True)[0]   # old → kept
+    max_authors = int(os.environ.get('HCGC_AMINER_MAX_AUTHORS', '6564'))
+    if max_authors > 0 and len(labeled_ids) > max_authors:
+        gen = torch.Generator()
+        gen.manual_seed(42)
+        perm = torch.randperm(len(labeled_ids), generator=gen)[:max_authors]
+        labeled_ids = labeled_ids[perm].sort().values
+        labeled_mask = torch.zeros_like(labeled_mask)
+        labeled_mask[labeled_ids] = True
+        print(f"  [AMiner] sampled labeled authors: {len(labeled_ids):,} "
+              f"(set HCGC_AMINER_MAX_AUTHORS=0 to use full labeled set)")
+
     a_old2new    = torch.full((full[target].num_nodes,), -1, dtype=torch.long)
     a_old2new[labeled_ids] = torch.arange(len(labeled_ids))
     full_num_nodes = {
