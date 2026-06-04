@@ -1606,7 +1606,8 @@ def run_once(data, target_type, ratio, device, pretrain,
              coarsen_l2_normalize=True, relprop_hops=2, relprop_outdim=128,
              pretrain_epochs=100, pretrain_patience=5,
              use_soft_labels=False, eval_protocol='original',
-             pairwise_merge=False, type_thresholds=False,
+             pairwise_merge=True, merge_objective='ward',
+             type_thresholds=False,
              metapath_thresholds=False, edge_weight_mode='binary',
              freeze_node_types=None, compressor='hcgc',
              ratio_search='fast', auto_search_runs=8,
@@ -1662,6 +1663,7 @@ def run_once(data, target_type, ratio, device, pretrain,
                 mini_batch_size = mini_batch_size,
                 use_soft_labels = use_soft_labels,
                 pairwise_merge  = pairwise_merge or compressor == 'cgc_type',
+                merge_objective = merge_objective,
                 type_thresholds = False if compressor == 'cgc_type' else type_thresholds,
                 metapath_thresholds = (
                     False if compressor == 'cgc_type' else metapath_thresholds),
@@ -1804,11 +1806,22 @@ def main():
     parser.add_argument('--soft-labels', action='store_true',
                         help='Train compressed supernodes with class-proportion soft labels '
                              'instead of hard majority-vote labels.')
-    parser.add_argument('--pairwise-merge', action='store_true',
-                        help='CGC-like ablation: each density leader merges only the '
-                             'single cheapest eligible neighbour under marginal join '
-                             'cost instead of absorbing all neighbours inside the '
-                             'Ball Multi-Merge radius.')
+    parser.add_argument('--pairwise-merge', dest='pairwise_merge',
+                        action='store_true', default=True,
+                        help='Use pairwise coalition formation: each density leader '
+                             'merges only the single cheapest eligible neighbour '
+                             'under marginal join cost. This is the default.')
+    parser.add_argument('--ball-multi-merge', dest='pairwise_merge',
+                        action='store_false', default=argparse.SUPPRESS,
+                        help='Use the previous Ball Multi-Merge policy, where each '
+                             'leader absorbs all eligible neighbours inside the '
+                             'merge radius.')
+    parser.add_argument('--merge-objective', default='ward',
+                        choices=['ward', 'quotient_de'],
+                        help='Merge objective for HCGC. ward uses centroid '
+                             'distortion; quotient_de accepts only merges that '
+                             'decrease the local mediator-induced projected '
+                             'Dirichlet energy.')
     parser.add_argument('--type-thresholds', action='store_true',
                         help='Estimate per-source-type threshold bases from '
                              'mediator-pair energy samples, then search one global '
@@ -1858,6 +1871,7 @@ def main():
     print(f"  freeze   : {args.freeze_node_types or 'none'}")
     _merge_mode = 'pairwise' if args.pairwise_merge or args.compressor == 'cgc_type' else 'ball-multi'
     print(f"  merge    : {_merge_mode}")
+    print(f"  merge_obj: {args.merge_objective}")
     _thresh_mode = ('metapath-auto' if args.metapath_thresholds
                     else 'type-auto' if args.type_thresholds else 'global')
     print(f"  thresh   : {_thresh_mode}")
@@ -1919,6 +1933,7 @@ def main():
                      pretrain_patience=args.pretrain_patience,
                      use_soft_labels=args.soft_labels,
                      pairwise_merge=args.pairwise_merge,
+                     merge_objective=args.merge_objective,
                      type_thresholds=args.type_thresholds,
                      metapath_thresholds=args.metapath_thresholds,
                      edge_weight_mode=args.edge_weight_mode,
@@ -1945,6 +1960,7 @@ def main():
                      pretrain_patience=args.pretrain_patience,
                      use_soft_labels=args.soft_labels,
                      pairwise_merge=args.pairwise_merge,
+                     merge_objective=args.merge_objective,
                      type_thresholds=args.type_thresholds,
                      metapath_thresholds=args.metapath_thresholds,
                      edge_weight_mode=args.edge_weight_mode,
@@ -1983,6 +1999,7 @@ def main():
             pretrain_patience = args.pretrain_patience,
             use_soft_labels  = args.soft_labels,
             pairwise_merge   = args.pairwise_merge,
+            merge_objective  = args.merge_objective,
             type_thresholds  = args.type_thresholds,
             metapath_thresholds = args.metapath_thresholds,
             edge_weight_mode = args.edge_weight_mode,

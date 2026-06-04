@@ -403,6 +403,8 @@ def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
 
     _ctx_mgr = _SuppressCStdout() if silent else contextlib.nullcontext()
     with _ctx_mgr:
+        _merge_obj = str(getattr(args, 'hcgc_merge_objective', 'ward')).lower()
+        _merge_obj_code = 1 if _merge_obj in ('quotient_de', 'projected_de', 'de') else 0
         try:
             cm = hcgc_module.create_graph_hcgc(
                 *_base_args,
@@ -413,6 +415,7 @@ def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
                 _pt_arr,
                 _pm_arr,
                 float(getattr(args, 'hcgc_target_comp_ratio', 0.0)),
+                _merge_obj_code,
             )
         except TypeError:
             if not silent:

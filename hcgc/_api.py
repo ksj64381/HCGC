@@ -42,7 +42,8 @@ def compress(
     mini_batch_size = 512,
     num_neighbors   = None,
     use_soft_labels = False,
-    pairwise_merge  = False,
+    pairwise_merge  = True,
+    merge_objective = 'ward',
     type_thresholds = False,
     metapath_thresholds = False,
     edge_weight_mode = 'binary',
@@ -93,10 +94,17 @@ def compress(
         use_soft_labels : If True, attach class-proportion soft labels to
                           compressed supernodes. Downstream training code must
                           read .soft_y for this to affect accuracy.
-        pairwise_merge  : If True, cap each Ball Multi-Merge leader to the
-                          single cheapest eligible merge under marginal join
-                          cost. This is a CGC-like one-by-one coalition
-                          formation ablation.
+        pairwise_merge  : If True, each density leader admits only the
+                          single cheapest eligible neighbour under marginal
+                          join cost. This is the default pairwise coalition
+                          formation policy. If False, leaders absorb all
+                          eligible neighbours inside the Ball Multi-Merge
+                          radius.
+        merge_objective : 'ward' uses the current centroid-distortion merge
+                          cost. 'quotient_de' accepts only merges that reduce
+                          the local mediator-induced projected Dirichlet
+                          energy, with the existing threshold kept as a
+                          similarity gate.
         type_thresholds : If True, estimate per-source-type merge threshold
                           bases from mediator-pair energy samples, then use
                           one global multiplier for target-ratio control.
@@ -185,6 +193,7 @@ def compress(
                        num_neighbors=num_neighbors,
                        use_soft_labels=use_soft_labels,
                        pairwise_merge=pairwise_merge,
+                       merge_objective=merge_objective,
                        type_thresholds=type_thresholds,
                        metapath_thresholds=metapath_thresholds,
                        ratio_search=ratio_search,
@@ -386,7 +395,8 @@ def _build_args(ratio, pretrain, pretrain_epochs,
                 relprop_outdim=128,
                 mini_batch_size=512, num_neighbors=None,
                 use_soft_labels=False,
-                pairwise_merge=False,
+                pairwise_merge=True,
+                merge_objective='ward',
                 type_thresholds=False,
                 metapath_thresholds=False,
                 ratio_search='fast',
@@ -415,6 +425,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         hcgc_skip_reassignment      = False,
         hcgc_window_size            = 20,
         hcgc_merge_cap_per_leader   = 1 if pairwise_merge else 0,
+        hcgc_merge_objective         = merge_objective,
         hcgc_target_comp_ratio      = 0.0,
         hcgc_num_levels             = 5,
         hub_anchor_percentile       = 0.0,

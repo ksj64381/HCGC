@@ -304,7 +304,7 @@ struct CSRGraph {
 
   // ── Coalition union-find ──────────────────────────────────────────────────
 
-  inline int find_root(int x) {
+  inline int find_root(int x) const {
     while (coalition_map[x] != x) x = coalition_map[x];
     return x;
   }
@@ -350,6 +350,55 @@ struct CSRGraph {
     float cnt_from = static_cast<float>(std::max(1, coalition_size[from]));
     float ward = (cnt_into * cnt_from) / std::max(cnt_into + cnt_from, 1.0f);
     return w_eff * ward * dist_sq;
+  }
+
+  inline float coalition_centroid_coord(int root, int d) const {
+    float cnt = static_cast<float>(std::max(1, coalition_size[root]));
+    return coalition_feat_sum[root][d] / cnt;
+  }
+
+  float local_projected_dirichlet_delta(
+      int cu, int cv, int dim,
+      float w_c, float w_d,
+      const std::vector<std::pair<int,float>> &candidates) const {
+    float n_c = static_cast<float>(std::max(1, coalition_size[cu]));
+    float n_d = static_cast<float>(std::max(1, coalition_size[cv]));
+    float inv_m = 1.0f / std::max(n_c + n_d, 1.0f);
+
+    float delta = 0.0f;
+
+    // The candidate list is the local same-type graph induced by one mediator.
+    // Merging cu and cv removes their projected edge and rewires both incident
+    // projected edges to the merged centroid.
+    for (const auto &cand : candidates) {
+      int r = find_root(cand.first);
+      if (r == cu || r == cv) continue;
+
+      float w_r = cand.second;
+      float dist_cr = 0.0f, dist_dr = 0.0f, dist_mr = 0.0f;
+      for (int d = 0; d < dim; ++d) {
+        float mu_c = coalition_centroid_coord(cu, d);
+        float mu_d = coalition_centroid_coord(cv, d);
+        float mu_r = coalition_centroid_coord(r, d);
+        float mu_m = (n_c * mu_c + n_d * mu_d) * inv_m;
+
+        float diff_cr = mu_c - mu_r;
+        float diff_dr = mu_d - mu_r;
+        float diff_mr = mu_m - mu_r;
+        dist_cr += diff_cr * diff_cr;
+        dist_dr += diff_dr * diff_dr;
+        dist_mr += diff_mr * diff_mr;
+      }
+
+      delta += (w_c * w_r + w_d * w_r) * dist_mr
+             - (w_c * w_r) * dist_cr
+             - (w_d * w_r) * dist_dr;
+    }
+
+    delta -= (w_c * w_d) * coalition_centroid_dist_sq(cu, cv, dim);
+    if (!std::isfinite(delta))
+      return std::numeric_limits<float>::infinity();
+    return delta;
   }
 
   void init_coalition_map() {
@@ -630,7 +679,8 @@ struct CSRGraph {
                                              bool skip_reassignment,
                                              int outer_idx,
                                              int window_size = 20,
-                                             int merge_cap_per_leader = 0) {
+                                             int merge_cap_per_leader = 0,
+                                             int merge_objective = 0) {
     std::mt19937 rng(42 + outer_idx);
     std::normal_distribution<float> rand_dist(0.0f, 1.0f);
 
@@ -730,6 +780,7 @@ struct CSRGraph {
             // 3-phase Ball Multi-Merge: avoids the greedy first-come-first-merged
             // bias by electing leaders based on local density before merging.
             bool marginal_join_cost = (merge_cap_per_leader > 0);
+            bool use_projected_de = (merge_objective == 1);
 
             // Phase 1: Density Estimation
             std::vector<int> density(candidates.size(), 0);
@@ -743,9 +794,18 @@ struct CSRGraph {
                 int cv = find_root(candidates[j].first);
                 if (cu == cv) { density[i]++; continue; }
                 float w_eff = candidates[i].second * candidates[j].second;
-                float cost = coalition_merge_cost(cu, cv, dim, w_eff,
-                                                  marginal_join_cost);
-                if (cost <= threshold) density[i]++;
+                float gate_cost = coalition_merge_cost(cu, cv, dim, w_eff,
+                                                       marginal_join_cost);
+                bool admissible = false;
+                if (use_projected_de) {
+                  float de_delta = local_projected_dirichlet_delta(
+                      cu, cv, dim, candidates[i].second, candidates[j].second,
+                      candidates);
+                  admissible = (de_delta < 0.0f && gate_cost <= threshold);
+                } else {
+                  admissible = (gate_cost <= threshold);
+                }
+                if (admissible) density[i]++;
               }
             }
 
@@ -791,9 +851,17 @@ struct CSRGraph {
                   if (cu == cv) continue;
 
                   float w_eff = candidates[ci].second * candidates[j].second;
-                  float cost = coalition_merge_cost(cu, cv, dim, w_eff,
-                                                    marginal_join_cost);
-                  if (cost > threshold) continue;
+                  float gate_cost = coalition_merge_cost(cu, cv, dim, w_eff,
+                                                        marginal_join_cost);
+                  float cost = gate_cost;
+                  bool admissible = (gate_cost <= threshold);
+                  if (use_projected_de) {
+                    cost = local_projected_dirichlet_delta(
+                        cu, cv, dim, candidates[ci].second,
+                        candidates[j].second, candidates);
+                    admissible = (cost < 0.0f && gate_cost <= threshold);
+                  }
+                  if (!admissible) continue;
 
                   if (merge_cap_per_leader <= 0) {
                     merge_coalitions(cv, cu);
@@ -905,7 +973,8 @@ create_graph_hcgc(py::array_t<int>   src_nodes,
                   float hub_anchor_percentile  = 0.0f,
                   py::array_t<float> feat_var_scale_per_type_arr = py::array_t<float>(),
                   py::array_t<float> feat_var_scale_by_src_med_arr = py::array_t<float>(),
-                  float target_comp_ratio = 0.0f) {
+                  float target_comp_ratio = 0.0f,
+                  int   merge_objective = 0) {
 
   py::buffer_info src_buf   = src_nodes.request();
   py::buffer_info dst_buf   = dst_nodes.request();
@@ -1071,7 +1140,7 @@ create_graph_hcgc(py::array_t<int>   src_nodes,
 
       auto [m, s] = cur_ptr->coarse_graph_hcgc_once(
           inner_passes, feat_var_scale, skip_reassignment, outer,
-          window_size, merge_cap_per_leader);
+          window_size, merge_cap_per_leader, merge_objective);
       std::cout << "[HCGC] Outer " << (outer+1) << ": "
                 << m << " merges, " << s << " switches\n";
       std::cout.flush();
@@ -1202,5 +1271,6 @@ PYBIND11_MODULE(hcgc_module, m) {
         py::arg("hub_anchor_percentile")      = 0.0f,
         py::arg("feat_var_scale_per_type")    = py::array_t<float>(),
         py::arg("feat_var_scale_by_src_med")  = py::array_t<float>(),
-        py::arg("target_comp_ratio")          = 0.0f);
+        py::arg("target_comp_ratio")          = 0.0f,
+        py::arg("merge_objective")            = 0);
 }

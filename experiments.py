@@ -47,6 +47,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
               relprop_hops=2, relprop_outdim=128,
               type_thresholds=False, metapath_thresholds=False,
               edge_weight_mode='binary', compressor='hcgc',
+              pairwise_merge=True, merge_objective='ward',
               ratio_search='fast', auto_search_runs=8,
               auto_target_tolerance=None):
     """Run compress?뭪rain for each ratio and return collected stats.
@@ -68,6 +69,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     print(f"  pretrain : {pretrain}")
     print(f"  emb      : {emb_method if pretrain else 'raw'}")
     print(f"  edge_w   : {edge_weight_mode}")
+    print(f"  merge    : {'pairwise' if pairwise_merge or compressor == 'cgc_type' else 'ball-multi'}")
+    print(f"  merge_obj: {merge_objective}")
     _thresh_mode = ('metapath-auto' if metapath_thresholds
                     else 'type-auto' if type_thresholds else 'global')
     print(f"  thresh   : {_thresh_mode}")
@@ -129,6 +132,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      type_thresholds=type_thresholds,
                      metapath_thresholds=metapath_thresholds,
                      edge_weight_mode=edge_weight_mode,
+                     pairwise_merge=pairwise_merge,
+                     merge_objective=merge_objective,
                      compressor=compressor,
                      ratio_search=ratio_search,
                      auto_search_runs=auto_search_runs,
@@ -146,6 +151,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      type_thresholds=type_thresholds,
                      metapath_thresholds=metapath_thresholds,
                      edge_weight_mode=edge_weight_mode,
+                     pairwise_merge=pairwise_merge,
+                     merge_objective=merge_objective,
                      compressor=compressor,
                      ratio_search=ratio_search,
                      auto_search_runs=auto_search_runs,
@@ -176,6 +183,8 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                 type_thresholds = type_thresholds,
                 metapath_thresholds = metapath_thresholds,
                 edge_weight_mode = edge_weight_mode,
+                pairwise_merge   = pairwise_merge,
+                merge_objective  = merge_objective,
                 compressor      = compressor,
                 ratio_search    = ratio_search,
                 auto_search_runs = auto_search_runs,
@@ -274,7 +283,7 @@ def print_sweep_table(base_stats, sweep, dataset):
 
 
 def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc',
-                    ratio_search='fast'):
+                    ratio_search='fast', merge_objective='ward'):
     if not plot_dir:
         return None
     import json
@@ -283,7 +292,8 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc',
 
     out_dir = Path(plot_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"proxy_sweep_{dataset}_{model_name}_{compressor}_{ratio_search}"
+    obj_tag = '' if str(merge_objective).lower() == 'ward' else f"_{merge_objective}"
+    stem = f"proxy_sweep_{dataset}_{model_name}_{compressor}_{ratio_search}{obj_tag}"
     out_path = out_dir / f"{stem}.png"
     json_path = out_dir / f"{stem}.json"
     csv_path = out_dir / f"{stem}.csv"
@@ -301,8 +311,9 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc',
         'val_oracle': arr('val_oracle_mean').tolist(),
         'test_oracle': arr('oracle_mean').tolist(),
         'emb_dist': arr('emb_dist_mean').tolist(),
+        'merge_objective': merge_objective,
         'title': (f'{dataset} {model_name} {compressor} '
-                  f'{ratio_search} compression proxy sweep'),
+                  f'{ratio_search} {merge_objective} compression proxy sweep'),
         'out': str(out_path),
     }
     with json_path.open('w', encoding='utf-8') as f:
@@ -380,7 +391,8 @@ def print_compressor_table(all_results, dataset, models, compressors):
 
 
 def save_comparison_outputs(all_results, dataset, models, compressors,
-                            plot_dir, ratio_search='fast'):
+                            plot_dir, ratio_search='fast',
+                            merge_objective='ward'):
     if not plot_dir:
         return None
     import csv
@@ -391,7 +403,8 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
     out_dir.mkdir(parents=True, exist_ok=True)
     model_tag = '-'.join(models)
     comp_tag = '-'.join(compressors)
-    stem = f"compressor_compare_{dataset}_{model_tag}_{comp_tag}_{ratio_search}"
+    obj_tag = '' if str(merge_objective).lower() == 'ward' else f"_{merge_objective}"
+    stem = f"compressor_compare_{dataset}_{model_tag}_{comp_tag}_{ratio_search}{obj_tag}"
     csv_path = out_dir / f"{stem}.csv"
     json_path = out_dir / f"{stem}.json"
     png_path = out_dir / f"{stem}.png"
@@ -406,6 +419,7 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
                     'model': model_name,
                     'compressor': compressor,
                     'ratio_search': ratio_search,
+                    'merge_objective': merge_objective,
                     'ratio': e['ratio'],
                     'compression': e['comp_mean'],
                     'test_acc_mean': e['acc_mean'],
@@ -442,6 +456,7 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
         'models': models,
         'compressors': compressors,
         'ratio_search': ratio_search,
+        'merge_objective': merge_objective,
         'rows': rows,
     }
     with json_path.open('w', encoding='utf-8') as f:
@@ -484,6 +499,7 @@ plt.close(fig)
         'models': models,
         'compressors': compressors,
         'ratio_search': ratio_search,
+        'merge_objective': merge_objective,
         'rows': rows,
         'out': str(png_path),
     })
@@ -560,6 +576,17 @@ def main():
     parser.add_argument('--metapath-thresholds', action='store_true',
                         help='Use auto-calibrated per-(source type, mediator type) '
                              'thresholds. Takes precedence over --type-thresholds.')
+    parser.add_argument('--pairwise-merge', dest='pairwise_merge',
+                        action='store_true', default=True,
+                        help='Use pairwise coalition formation. This is the default.')
+    parser.add_argument('--ball-multi-merge', dest='pairwise_merge',
+                        action='store_false', default=argparse.SUPPRESS,
+                        help='Use the previous Ball Multi-Merge policy.')
+    parser.add_argument('--merge-objective', default='ward',
+                        choices=['ward', 'quotient_de'],
+                        help='Merge objective for HCGC. quotient_de accepts '
+                             'only merges that reduce the local mediator-induced '
+                             'projected Dirichlet energy.')
     parser.add_argument('--edge-weight-mode', default='binary',
                         choices=['binary', 'count', 'log_count', 'density'],
                         help='Compressed super-edge weighting mode.')
@@ -627,6 +654,8 @@ def main():
                 type_thresholds = args.type_thresholds,
                 metapath_thresholds = args.metapath_thresholds,
                 edge_weight_mode = args.edge_weight_mode,
+                pairwise_merge   = args.pairwise_merge,
+                merge_objective  = args.merge_objective,
                 compressor      = compressor,
                 ratio_search    = args.ratio_search,
                 auto_search_runs = args.auto_search_runs,
@@ -636,12 +665,14 @@ def main():
                 baseline_by_model[mname] = base_stats
             print_sweep_table(base_stats, sweep, args.dataset)
             save_sweep_plot(sweep, args.dataset, mname, args.plot_dir,
-                            compressor, args.ratio_search)
+                            compressor, args.ratio_search,
+                            args.merge_objective)
             all_results[(mname, compressor)] = (base_stats, sweep)
 
     print_compressor_table(all_results, args.dataset, models, compressors)
     save_comparison_outputs(all_results, args.dataset, models, compressors,
-                            args.plot_dir, args.ratio_search)
+                            args.plot_dir, args.ratio_search,
+                            args.merge_objective)
 
 
 if __name__ == '__main__':
