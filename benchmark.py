@@ -460,7 +460,12 @@ def load_acm(root):
         os.makedirs(acm_root, exist_ok=True)
         zip_path = os.path.join(acm_root, 'ACM.zip')
 
-        _mirrors = [
+        _mat_mirrors = [
+            'https://data.dgl.ai/dataset/ACM.mat',
+            'https://dgl-data.s3-accelerate.amazonaws.com/dataset/ACM.mat',
+            'https://dgl-data.s3.us-west-2.amazonaws.com/dataset/ACM.mat',
+        ]
+        _zip_mirrors = [
             'https://data.dgl.ai/dataset/ACM.zip',
             'https://dgl-data.s3-accelerate.amazonaws.com/dataset/ACM.zip',
             'https://dgl-data.s3.us-west-2.amazonaws.com/dataset/ACM.zip',
@@ -471,12 +476,12 @@ def load_acm(root):
                            'Gecko/20100101 Firefox/115.0')
         }
         _downloaded = False
-        for _url in _mirrors:
+        for _url in _mat_mirrors:
             try:
                 print(f'  Downloading ACM from {_url} ...')
                 req = urllib.request.Request(_url, headers=_headers)
                 with urllib.request.urlopen(req, timeout=120) as _resp, \
-                     open(zip_path, 'wb') as _f:
+                     open(mat_path, 'wb') as _f:
                     _f.write(_resp.read())
                 _downloaded = True
                 break
@@ -484,19 +489,33 @@ def load_acm(root):
                 print(f'  Failed ({type(_e).__name__}: {_e}), trying next ...')
 
         if not _downloaded:
+            for _url in _zip_mirrors:
+                try:
+                    print(f'  Downloading ACM from {_url} ...')
+                    req = urllib.request.Request(_url, headers=_headers)
+                    with urllib.request.urlopen(req, timeout=120) as _resp, \
+                         open(zip_path, 'wb') as _f:
+                        _f.write(_resp.read())
+                    with zipfile.ZipFile(zip_path) as zf:
+                        zf.extractall(acm_root)
+                    os.remove(zip_path)
+                    _downloaded = True
+                    break
+                except Exception as _e:
+                    print(f'  Failed ({type(_e).__name__}: {_e}), trying next ...')
+
+        if not _downloaded:
             sys.exit(
                 "\nAll ACM download mirrors failed.\n\n"
                 "Manual download (choose one):\n"
-                "  https://data.dgl.ai/dataset/ACM.zip\n"
-                "  https://dgl-data.s3-accelerate.amazonaws.com/dataset/ACM.zip\n\n"
+                "  https://data.dgl.ai/dataset/ACM.mat\n"
+                "  https://dgl-data.s3-accelerate.amazonaws.com/dataset/ACM.mat\n"
+                "  https://data.dgl.ai/dataset/ACM.zip\n\n"
                 "Then place ACM.mat at:\n"
                 f"  {mat_path}\n"
                 "(Unzip ACM.zip and move ACM.mat if needed.)"
             )
 
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(acm_root)
-        os.remove(zip_path)
         # The zip may extract into a sub-folder; move mat file up if needed.
         nested = os.path.join(acm_root, 'ACM', 'ACM.mat')
         if os.path.exists(nested) and not os.path.exists(mat_path):
