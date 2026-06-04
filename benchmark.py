@@ -951,6 +951,66 @@ class _DownstreamGAT(torch.nn.Module):
         return self.clf(h[target_type])
 
 
+class _APPNPPropConv(MessagePassing):
+    """One unweighted relation-specific propagation step for Hetero-APPNP."""
+
+    def __init__(self):
+        super().__init__(aggr='mean')
+
+    def forward(self, x, edge_index, size=None):
+        if isinstance(x, tuple):
+            x_src, x_dst = x
+        else:
+            x_src = x_dst = x
+        return self.propagate(edge_index, x=x_src,
+                              size=(x_src.size(0), x_dst.size(0)))
+
+    def message(self, x_j):
+        return x_j
+
+
+class _DownstreamAPPNP(torch.nn.Module):
+    """Heterogeneous APPNP-style downstream model.
+
+    APPNP first predicts hidden representations and then repeatedly propagates
+    them with a teleport term.  This hetero variant uses one mean-aggregation
+    propagation channel per relation type and averages relation outputs through
+    HeteroConv, which keeps the existing HeteroData evaluation protocol intact.
+    """
+
+    def __init__(self, data, hidden, num_classes, dropout=0.5,
+                 K=10, alpha=0.1):
+        super().__init__()
+        self._ntypes = [nt for nt in data.node_types
+                        if hasattr(data[nt], 'x') and data[nt].x is not None]
+        self.proj = torch.nn.ModuleDict({
+            nt.replace('.', '_'): torch.nn.Linear(data[nt].x.shape[1], hidden)
+            for nt in self._ntypes
+        })
+        self.prop = HeteroConv(
+            {et: _APPNPPropConv() for et in data.edge_types},
+            aggr='mean')
+        self.clf = torch.nn.Linear(hidden, num_classes)
+        self.drop = torch.nn.Dropout(dropout)
+        self.K = int(K)
+        self.alpha = float(alpha)
+
+    def forward(self, x_dict, edge_index_dict, target_type):
+        h0 = {nt: F.relu(self.proj[nt.replace('.', '_')](x))
+              for nt, x in x_dict.items() if nt in self._ntypes}
+        h0 = {k: self.drop(v) for k, v in h0.items()}
+        h = h0
+        for _ in range(self.K):
+            prop = self.prop(h, edge_index_dict)
+            h = {
+                nt: (1.0 - self.alpha) * (
+                        prop[nt] if prop.get(nt) is not None else h[nt])
+                    + self.alpha * h0[nt]
+                for nt in h0
+            }
+        return self.clf(h[target_type])
+
+
 class _DownstreamRGCN(torch.nn.Module):
     """Relational GCN (Schlichtkrull et al., ESWC 2018).
 
@@ -985,7 +1045,7 @@ class _DownstreamRGCN(torch.nn.Module):
         return self.clf(h[target_type])
 
 
-_DOWNSTREAM_MODELS = ('sage', 'hgt', 'gat', 'rgcn')
+_DOWNSTREAM_MODELS = ('sage', 'hgt', 'gat', 'rgcn', 'appnp')
 
 
 def _edge_weight_dict(data):
@@ -1006,6 +1066,8 @@ def _build_downstream_model(data, target_type, model_name, hidden, num_classes,
         m = _DownstreamGAT(data, hidden, num_classes, dropout)
     elif model_name == 'rgcn':
         m = _DownstreamRGCN(data, hidden, num_classes, dropout)
+    elif model_name == 'appnp':
+        m = _DownstreamAPPNP(data, hidden, num_classes, dropout)
     else:   # 'sage' (default)
         feat_dims = {nt: data[nt].x.shape[1]
                      for nt in data.node_types
