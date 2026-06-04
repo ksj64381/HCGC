@@ -537,8 +537,29 @@ def load_acm(root):
         ])
 
     # ── Paper features & labels ───────────────────────────────────────────────
-    feat    = torch.from_numpy(_dense(mat['feature'])).float()
-    lbl_oh  = _dense(mat['label'])
+    if 'feature' in mat:
+        feat = torch.from_numpy(_dense(mat['feature'])).float()
+    elif 'PvsT' in mat:
+        # DGL/HAN ACM.mat stores paper-term bag-of-words as PvsT.
+        feat = torch.from_numpy(_dense(mat['PvsT'])).float()
+    else:
+        keys = sorted(k for k in mat.keys() if not k.startswith('__'))
+        raise RuntimeError(
+            "ACM.mat has no 'feature' or 'PvsT' paper feature matrix. "
+            f"Available keys: {keys}")
+
+    if 'label' in mat:
+        lbl_oh = _dense(mat['label'])
+    elif 'PvsL' in mat:
+        lbl_oh = _dense(mat['PvsL'])
+    elif 'PvsC' in mat and getattr(mat['PvsC'], 'shape', (0, 0))[1] <= 3:
+        lbl_oh = _dense(mat['PvsC'])
+    else:
+        keys = sorted(k for k in mat.keys() if not k.startswith('__'))
+        raise RuntimeError(
+            "ACM.mat has no 'label' or 'PvsL' label matrix. "
+            f"Available keys: {keys}")
+
     labels  = torch.from_numpy(lbl_oh.argmax(axis=1).astype('int64'))
     n_paper = feat.shape[0]
 
@@ -551,12 +572,37 @@ def load_acm(root):
         m[torch.from_numpy(idx)] = True
         return m
 
+    def _standard_acm_split():
+        gen = torch.Generator()
+        gen.manual_seed(42)
+        train = torch.zeros(n_paper, dtype=torch.bool)
+        val = torch.zeros(n_paper, dtype=torch.bool)
+        test = torch.zeros(n_paper, dtype=torch.bool)
+        for c in labels.unique(sorted=True).tolist():
+            idx = (labels == int(c)).nonzero(as_tuple=True)[0]
+            idx = idx[torch.randperm(len(idx), generator=gen)]
+            n_train = min(200, max(1, len(idx) // 3))
+            n_val = min(100, max(1, (len(idx) - n_train) // 4))
+            train[idx[:n_train]] = True
+            val[idx[n_train:n_train + n_val]] = True
+            test[idx[n_train + n_val:]] = True
+        print(f"  [ACM] split indices absent - created standard "
+              f"{int(train.sum()):,}/{int(val.sum()):,}/{int(test.sum()):,} "
+              "train/val/test masks (seed=42)")
+        return train, val, test
+
     data = HeteroData()
     data['paper'].x          = feat
     data['paper'].y          = labels
-    data['paper'].train_mask = _to_mask('train_idx')
-    data['paper'].val_mask   = _to_mask('val_idx')
-    data['paper'].test_mask  = _to_mask('test_idx')
+    if all(k in mat for k in ['train_idx', 'val_idx', 'test_idx']):
+        data['paper'].train_mask = _to_mask('train_idx')
+        data['paper'].val_mask   = _to_mask('val_idx')
+        data['paper'].test_mask  = _to_mask('test_idx')
+    else:
+        tr, va, te = _standard_acm_split()
+        data['paper'].train_mask = tr
+        data['paper'].val_mask   = va
+        data['paper'].test_mask  = te
 
     # ── Paper–Author edges ────────────────────────────────────────────────────
     PA = mat['PvsA']
