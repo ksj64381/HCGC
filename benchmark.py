@@ -38,12 +38,17 @@ except ImportError:
         return it
 
 import hcgc
-from hcgc._baselines import compress_ahugc_style, compress_random_type
+from hcgc._baselines import (
+    compress_ahugc_style,
+    compress_cgc_homo,
+    compress_random_type,
+)
 
 
 _COMPRESSORS = {
     'hcgc': 'HCGC',
     'cgc_type': 'CGC-type adaptation',
+    'cgc_homo': 'CGC-Homo naive adaptation',
     'random_type': 'Random type-isolated',
     'ahugc_style': 'AH-UGC-style hash',
 }
@@ -1647,6 +1652,16 @@ def run_once(data, target_type, ratio, device, pretrain,
                 freeze_node_types=freeze_node_types,
                 verbose=verbose,
             )
+        elif compressor == 'cgc_homo':
+            result = compress_cgc_homo(
+                data,
+                ratio=ratio,
+                target_type=target_type,
+                edge_weight_mode=edge_weight_mode,
+                use_soft_labels=use_soft_labels,
+                freeze_node_types=freeze_node_types,
+                verbose=verbose,
+            )
         else:
             result = hcgc.compress(
                 data,
@@ -1749,7 +1764,8 @@ def main():
                         choices=list(_COMPRESSORS),
                         help='Compression method to evaluate. ahugc_style and '
                              'random_type are fast type-isolated baselines; '
-                             'cgc_type is a CGC-like one-by-one adaptation.')
+                             'cgc_type is an HCGC pairwise ablation; cgc_homo '
+                             'is a naive homogeneous CGC-style adaptation.')
     parser.add_argument('--ratio-search', default='fast',
                         choices=['fast', 'precise'],
                         help='Target-ratio search mode for hcgc/cgc_type. '
