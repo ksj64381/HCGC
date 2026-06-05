@@ -168,20 +168,21 @@ def build_compressed_data(data, coalition_map, offsets, type_boundaries,
     ns_a = n_super[nt]
     y_orig = data[nt].y
 
-    labeled = data[nt].train_mask | data[nt].val_mask | data[nt].test_mask
+    train_labeled = data[nt].train_mask
     one_hot = torch.zeros(len(y_orig), _CFG.num_classes, dtype=torch.long)
-    if labeled.any():
-        one_hot[labeled] = (
-            torch.zeros(int(labeled.sum()), _CFG.num_classes, dtype=torch.long)
-            .scatter_(1, y_orig[labeled].unsqueeze(1), 1)
+    if train_labeled.any():
+        one_hot[train_labeled] = (
+            torch.zeros(int(train_labeled.sum()), _CFG.num_classes,
+                        dtype=torch.long)
+            .scatter_(1, y_orig[train_labeled].unsqueeze(1), 1)
         )
     vote = torch.zeros(ns_a, _CFG.num_classes, dtype=torch.long)
     vote.scatter_add_(0, lc_a.unsqueeze(1).expand(-1, _CFG.num_classes), one_hot)
 
-    # has_any_label[i] = True if supernode i contains ≥1 labeled original node.
-    # Supernodes with no labeled nodes get y=-1 (ignored in loss) instead of
-    # argmax=0 (spurious class-0 label) — important for semi-supervised datasets
-    # like Freebase where most nodes are unlabeled.
+    # Training labels must be induced only from original train nodes.  Including
+    # validation/test labels in the supernode majority vote leaks evaluation
+    # information and can collapse semi-supervised datasets such as Freebase to
+    # the global test-majority class under random coarsening.
     has_any_label = vote.sum(dim=1) > 0
     y_super = vote.argmax(dim=1)
     y_super[~has_any_label] = -1          # -1 = unlabeled / ignored
