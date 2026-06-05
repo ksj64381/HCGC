@@ -13,6 +13,9 @@ Usage
     # multi-model sweep: one table per model, summary table at the end
     python experiments.py --dataset dblp --ratios 0.3 0.1 --models sage hgt gat rgcn
 
+    # multi-dataset sweep: datasets run sequentially in the given order
+    python experiments.py --dataset imdb dblp acm --ratios 0.3 0.1 --models sage
+
     # quick smoke test (1 run, no warmup)
     python experiments.py --dataset dblp --ratios 0.3 0.2 0.1 --runs 1 --warmup 0
 """
@@ -539,8 +542,10 @@ def main():
         description='HCGC accuracy-compression tradeoff sweep.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--dataset',  required=True, choices=list(LOADERS),
-                        help='Dataset to sweep')
+    parser.add_argument('--dataset', '--datasets', dest='datasets',
+                        required=True, nargs='+', choices=list(LOADERS),
+                        metavar='D',
+                        help='Dataset(s) to sweep in the given order')
     parser.add_argument('--ratios',   type=float, nargs='+',
                         default=[0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1],
                         metavar='R',
@@ -613,6 +618,7 @@ def main():
                         help='If set, save accuracy/proxy sweep plots to this directory.')
     args = parser.parse_args()
 
+    datasets = args.datasets
     ratios   = sorted(args.ratios, reverse=True)   # high -low (less -more compressed)
     models   = args.models if args.models else [args.model]
     if args.all_compressors:
@@ -623,64 +629,71 @@ def main():
         compressors = [args.compressor]
     do_base  = not args.no_baseline
 
-    all_results = {}      # (model_name, compressor) -> (base_stats, sweep)
-    baseline_by_model = {}
     combo_idx = 0
-    total_combos = len(models) * len(compressors)
+    total_combos = len(datasets) * len(models) * len(compressors)
 
-    for mname in models:
-        for compressor in compressors:
-            combo_idx += 1
-            print(f"\n{'#'*72}")
-            print(f"  Job {combo_idx}/{total_combos}: model={mname}  "
-                  f"compressor={compressor}")
-            print(f"{'#'*72}")
+    for dataset in datasets:
+        all_results = {}      # (model_name, compressor) -> (base_stats, sweep)
+        baseline_by_model = {}
+        dataset_combo_idx = 0
 
-            base_override = baseline_by_model.get(mname)
-            run_baseline_now = do_base and base_override is None
-            warmup_now = args.warmup if combo_idx == 1 else 0
+        for mname in models:
+            for compressor in compressors:
+                combo_idx += 1
+                dataset_combo_idx += 1
+                print(f"\n{'#'*72}")
+                print(f"  Job {combo_idx}/{total_combos}: dataset={dataset}  "
+                      f"model={mname}  compressor={compressor}")
+                print(f"{'#'*72}")
 
-            base_stats, sweep = run_sweep(
-                dataset         = args.dataset,
-                ratios          = ratios,
-                runs            = args.runs,
-                warmup          = warmup_now,
-                device          = args.device,
-                root            = args.root,
-                pretrain        = not args.no_pretrain,
-                train_epochs    = args.train_epochs,
-                train_hidden    = args.train_hidden,
-                mini_batch_size = args.mini_batch_size,
-                model_name      = mname,
-                baseline        = run_baseline_now,
-                baseline_stats  = base_override,
-                emb_method      = args.emb_method,
-                coarsen_l2_normalize = not args.raw_no_l2,
-                relprop_hops    = args.relprop_hops,
-                relprop_outdim  = args.relprop_outdim,
-                type_thresholds = args.type_thresholds,
-                metapath_thresholds = args.metapath_thresholds,
-                edge_weight_mode = args.edge_weight_mode,
-                pairwise_merge   = args.pairwise_merge,
-                merge_objective  = args.merge_objective,
-                skip_reassignment = args.skip_reassignment,
-                compressor      = compressor,
-                ratio_search    = args.ratio_search,
-                auto_search_runs = args.auto_search_runs,
-                auto_target_tolerance = args.auto_target_tolerance,
-            )
-            if do_base and mname not in baseline_by_model:
-                baseline_by_model[mname] = base_stats
-            print_sweep_table(base_stats, sweep, args.dataset)
-            save_sweep_plot(sweep, args.dataset, mname, args.plot_dir,
-                            compressor, args.ratio_search,
-                            args.merge_objective)
-            all_results[(mname, compressor)] = (base_stats, sweep)
+                base_override = baseline_by_model.get(mname)
+                run_baseline_now = do_base and base_override is None
+                warmup_now = args.warmup if dataset_combo_idx == 1 else 0
 
-    print_compressor_table(all_results, args.dataset, models, compressors)
-    save_comparison_outputs(all_results, args.dataset, models, compressors,
-                            args.plot_dir, args.ratio_search,
-                            args.merge_objective)
+                base_stats, sweep = run_sweep(
+                    dataset         = dataset,
+                    ratios          = ratios,
+                    runs            = args.runs,
+                    warmup          = warmup_now,
+                    device          = args.device,
+                    root            = args.root,
+                    pretrain        = not args.no_pretrain,
+                    train_epochs    = args.train_epochs,
+                    train_hidden    = args.train_hidden,
+                    mini_batch_size = args.mini_batch_size,
+                    model_name      = mname,
+                    baseline        = run_baseline_now,
+                    baseline_stats  = base_override,
+                    emb_method      = args.emb_method,
+                    coarsen_l2_normalize = not args.raw_no_l2,
+                    relprop_hops    = args.relprop_hops,
+                    relprop_outdim  = args.relprop_outdim,
+                    type_thresholds = args.type_thresholds,
+                    metapath_thresholds = args.metapath_thresholds,
+                    edge_weight_mode = args.edge_weight_mode,
+                    pairwise_merge   = args.pairwise_merge,
+                    merge_objective  = args.merge_objective,
+                    skip_reassignment = args.skip_reassignment,
+                    compressor      = compressor,
+                    ratio_search    = args.ratio_search,
+                    auto_search_runs = args.auto_search_runs,
+                    auto_target_tolerance = args.auto_target_tolerance,
+                )
+                if do_base and mname not in baseline_by_model:
+                    baseline_by_model[mname] = base_stats
+                print_sweep_table(base_stats, sweep, dataset)
+                save_sweep_plot(sweep, dataset, mname, args.plot_dir,
+                                compressor, args.ratio_search,
+                                args.merge_objective)
+                all_results[(mname, compressor)] = (base_stats, sweep)
+
+        print_compressor_table(all_results, dataset, models, compressors)
+        save_comparison_outputs(all_results, dataset, models, compressors,
+                                args.plot_dir, args.ratio_search,
+                                args.merge_objective)
+
+    if len(datasets) > 1:
+        print(f"\nCompleted dataset sweep: {', '.join(datasets)}")
 
 
 if __name__ == '__main__':

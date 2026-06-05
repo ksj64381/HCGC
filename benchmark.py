@@ -41,6 +41,7 @@ import hcgc
 from hcgc._baselines import (
     compress_ahugc_style,
     compress_cgc_homo,
+    compress_freehgc,
     compress_random_type,
 )
 
@@ -49,6 +50,7 @@ _COMPRESSORS = {
     'hcgc': 'HCGC',
     'cgc_type': 'CGC-type adaptation',
     'cgc_homo': 'CGC-Homo naive adaptation',
+    'freehgc': 'FreeHGC-style data selection',
     'random_type': 'Random type-isolated',
     'ahugc_style': 'AH-UGC-style hash',
 }
@@ -1716,6 +1718,16 @@ def run_once(data, target_type, ratio, device, pretrain,
             )
         elif compressor == 'cgc_homo':
             result = compress_cgc_homo(
+                data,
+                ratio=ratio,
+                target_type=target_type,
+                edge_weight_mode=edge_weight_mode,
+                use_soft_labels=use_soft_labels,
+                freeze_node_types=freeze_node_types,
+                verbose=verbose,
+            )
+        elif compressor == 'freehgc':
+            result = compress_freehgc(
                 data,
                 ratio=ratio,
                 target_type=target_type,
