@@ -175,9 +175,10 @@ def compress_freehgc(data, ratio=0.1, target_type=None,
       3. assign every original node to its nearest selected representative of
          the same type, then reuse the normal quotient-graph builder.
 
-    The requested ratio is interpreted like FreeHGC's reduction rate on target
-    training nodes.  The achieved graph compression is therefore reported and
-    should be compared by the actual compression column.
+    The requested ratio is interpreted as the per-type node retention ratio,
+    matching the other graph-coarsening baselines in this benchmark.  For the
+    target type, class-balanced training nodes are selected first, and the
+    remaining type budget is filled by graph reachability.
     """
     set_seed(seed)
     t_total = time.perf_counter()
@@ -432,18 +433,28 @@ def _freehgc_select_representatives(data, offsets, type_boundaries, adj,
     target = _CFG.target_type
     selected = {}
 
-    train_mask = data[target].train_mask.detach().cpu().bool()
-    y = data[target].y.detach().cpu().long()
-    train_idx = train_mask.nonzero(as_tuple=True)[0].numpy()
-    labels_train = y[train_mask].numpy()
+    target_pos = _CFG.node_types.index(target)
+    target_start = int(offsets[target])
+    target_end = int(type_boundaries[target_pos])
+    n_target = target_end - target_start
+    target_budget = _type_retention_budget(n_target, ratio)
 
-    n_train = len(train_idx)
-    target_budget = max(1, int(math.ceil(float(ratio) * n_train)))
-    target_budget = min(target_budget, n_train)
-    class_budget = _class_balanced_budget(labels_train, target_budget)
-    signatures = _coverage_signatures(
-        adj, int(offsets[target]), train_idx, max_hops=num_hops,
-        max_items=512)
+    if 'train_mask' in data[target] and 'y' in data[target]:
+        train_mask = data[target].train_mask.detach().cpu().bool()
+        y = data[target].y.detach().cpu().long()
+        train_idx = train_mask.nonzero(as_tuple=True)[0].numpy()
+        labels_train = y[train_mask].numpy()
+    else:
+        train_idx = np.empty(0, dtype=np.int64)
+        labels_train = np.empty(0, dtype=np.int64)
+
+    train_budget = min(
+        target_budget,
+        max(0, int(math.ceil(float(ratio) * len(train_idx)))))
+    class_budget = _class_balanced_budget(labels_train, train_budget)
+    signatures = (_coverage_signatures(
+        adj, target_start, train_idx, max_hops=num_hops, max_items=512)
+        if len(train_idx) > 0 else {})
 
     target_sel = []
     for cls, cnt in class_budget.items():
@@ -452,16 +463,27 @@ def _freehgc_select_representatives(data, offsets, type_boundaries, adj,
             continue
         target_sel.extend(_greedy_coverage_select(
             cls_nodes, signatures, cnt, rng))
-    if not target_sel and len(train_idx) > 0:
-        target_sel = [int(train_idx[0])]
-    selected[target] = np.array(sorted(set(int(v) for v in target_sel)), dtype=np.int64)
+    target_sel = set(int(v) for v in target_sel)
+    if not target_sel and len(train_idx) > 0 and target_budget > 0:
+        target_sel.add(int(train_idx[0]))
 
-    target_start = int(offsets[target])
+    if len(target_sel) < target_budget:
+        seed_global = [target_start + int(v) for v in target_sel]
+        seed_scores = _reachability_scores(adj, seed_global, max_hops=num_hops)
+        fill = _select_by_reachability(
+            start=target_start,
+            n=n_target,
+            k=target_budget - len(target_sel),
+            scores=seed_scores,
+            rng=rng,
+            exclude=target_sel,
+        )
+        target_sel.update(int(v) for v in fill)
+
+    selected[target] = np.array(sorted(target_sel), dtype=np.int64)
+
     selected_global = [target_start + int(v) for v in selected[target]]
     reach_scores = _reachability_scores(adj, selected_global, max_hops=num_hops)
-
-    n_target = int(type_boundaries[_CFG.node_types.index(target)]) - target_start
-    real_rate = len(selected[target]) / max(n_target, 1)
     for i, nt in enumerate(_CFG.node_types):
         if nt == target:
             continue
@@ -471,18 +493,16 @@ def _freehgc_select_representatives(data, offsets, type_boundaries, adj,
         if n <= 0:
             selected[nt] = np.empty(0, dtype=np.int64)
             continue
-        k = max(1, int(math.ceil(real_rate * n)))
-        k = min(k, n)
-        scores = np.array([reach_scores.get(start + j, 0.0) for j in range(n)])
-        if np.all(scores <= 0):
-            local = np.arange(n)
-            rng.shuffle(local)
-            chosen = np.sort(local[:k])
-        else:
-            chosen = np.argsort(-scores, kind='stable')[:k]
-            chosen = np.sort(chosen)
+        k = _type_retention_budget(n, ratio)
+        chosen = _select_by_reachability(start, n, k, reach_scores, rng)
         selected[nt] = chosen.astype(np.int64)
     return selected
+
+
+def _type_retention_budget(n, ratio):
+    if n <= 0:
+        return 0
+    return min(n, max(1, int(math.ceil(float(ratio) * n))))
 
 
 def _class_balanced_budget(labels, total_budget):
@@ -491,25 +511,39 @@ def _class_balanced_budget(labels, total_budget):
         counts[int(c)] += 1
     if not counts:
         return {}
-    items = sorted(counts.items(), key=lambda kv: kv[1])
-    budget = {}
-    used = 0
-    n = max(1, len(labels))
-    for idx, (cls, cnt) in enumerate(items):
-        if idx == len(items) - 1:
-            b = total_budget - used
-        else:
-            b = max(1, int(math.floor(total_budget * cnt / n)))
-            used += b
-        budget[cls] = max(0, min(int(cnt), int(b)))
-    short = total_budget - sum(budget.values())
-    if short > 0:
-        for cls, cnt in sorted(counts.items(), key=lambda kv: -kv[1]):
-            add = min(short, cnt - budget.get(cls, 0))
-            budget[cls] = budget.get(cls, 0) + add
-            short -= add
-            if short <= 0:
+    total_budget = min(int(total_budget), len(labels))
+    if total_budget <= 0:
+        return {}
+
+    classes = sorted(counts)
+    if total_budget < len(classes):
+        keep = sorted(classes, key=lambda c: (-counts[c], c))[:total_budget]
+        return {int(c): 1 for c in keep}
+
+    budget = {int(c): 1 for c in classes}
+    remaining = total_budget - len(classes)
+    capacity = {int(c): max(0, int(counts[c]) - 1) for c in classes}
+    cap_total = sum(capacity.values())
+    if remaining <= 0 or cap_total <= 0:
+        return budget
+
+    raw = {c: remaining * capacity[c] / cap_total for c in classes}
+    for c in classes:
+        add = min(capacity[c], int(math.floor(raw[c])))
+        budget[int(c)] += add
+        remaining -= add
+
+    if remaining > 0:
+        order = sorted(classes, key=lambda c: (-(raw[c] - math.floor(raw[c])), -counts[c], c))
+        for c in order:
+            if remaining <= 0:
                 break
+            room = capacity[int(c)] - (budget[int(c)] - 1)
+            if room <= 0:
+                continue
+            add = min(room, remaining)
+            budget[int(c)] += add
+            remaining -= add
     return {c: b for c, b in budget.items() if b > 0}
 
 
@@ -586,6 +620,31 @@ def _reachability_scores(adj, selected_global, max_hops=2):
     return scores
 
 
+def _select_by_reachability(start, n, k, scores, rng, exclude=None):
+    if n <= 0 or k <= 0:
+        return np.empty(0, dtype=np.int64)
+    exclude = set(int(v) for v in (exclude or []))
+    candidates = np.array(
+        [j for j in range(n) if j not in exclude],
+        dtype=np.int64,
+    )
+    if len(candidates) == 0:
+        return np.empty(0, dtype=np.int64)
+    if k >= len(candidates):
+        return np.sort(candidates)
+
+    vals = np.array(
+        [scores.get(start + int(j), 0.0) for j in candidates],
+        dtype=np.float64,
+    )
+    if np.all(vals <= 0):
+        shuffled = candidates.copy()
+        rng.shuffle(shuffled)
+        return np.sort(shuffled[:k])
+    order = np.argsort(-vals, kind='stable')[:k]
+    return np.sort(candidates[order])
+
+
 def _assignment_map_from_representatives(data, offsets, type_boundaries,
                                          rep_dict, selected):
     n_total = int(type_boundaries[-1])
@@ -609,6 +668,7 @@ def _assignment_map_from_representatives(data, offsets, type_boundaries,
             score = rep[s:e] @ anchor_rep.t()
             nearest = score.argmax(dim=1).cpu().numpy()
             assigned[s:e] = anchors[nearest]
+        assigned[anchors] = anchors
         cm[start:end] = start + assigned
     return cm
 
