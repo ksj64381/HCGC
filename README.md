@@ -1,6 +1,6 @@
 # HCGC: Heterogeneous Graph Coarsening via Coalition Games
 
-HCGC compresses heterogeneous graphs (PyG `HeteroData`) while preserving structure for downstream GNN training. A 10× compressed graph typically trains 5–8× faster with less than 1% accuracy loss.
+"A 10× compressed graph typically trains 5–8× faster per run; accuracy retention depends on the dataset and compression ratio (see the paper for full results)."
 
 ## Quick Start
 
@@ -39,21 +39,16 @@ Or install everything at once:
 pip install -r requirements.txt
 ```
 
-### Option 1 — Compile the C++ kernel (recommended)
+### How To Compile the C++ kernel
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/HCGC.git
+git clone https://github.com/ksj64381/HCGC.git
 cd HCGC
 python setup.py build_ext --inplace
 ```
 
 After building, `hcgc_module.*.pyd` (Windows) or `hcgc_module.*.so` (Linux/macOS) will appear in the project root.
 
-### Option 2 — Pre-built binary
-
-Download the pre-built binary matching your platform and Python version from the [Releases](../../releases) page, and place it in `hcgc/_ext/`. HCGC will find it automatically at import time.
-
-Naming convention: `hcgc_module.cpXY-win_amd64.pyd` (Windows) or `hcgc_module.cpXY-linux-x86_64.so` (Linux), where `XY` is the Python version (e.g. `312` for Python 3.12).
 
 ## API Reference
 
@@ -125,11 +120,22 @@ result = hcgc.compress(data, ratio=0.1, target_type='paper')
 
 ## Reproducing Paper Results
 
-See [`benchmark.py`](benchmark.py) for the full benchmark script.
+Main results (Tables I–II, Fig. 3):
 
 ```bash
-python benchmark.py --dataset imdb --ratio 0.1
-python benchmark.py --dataset acm  --ratio 0.1
+python experiments.py --dataset imdb dblp acm \
+  --models sage rgcn gat appnp \
+  --compressors hcgc freehgc cgc_homo random_type ahugc_style \
+  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
+  --runs 3 --warmup 1 --device cuda --plot-dir sweep_results
+```
+
+Ablation study (Table III):
+
+```bash
+python ablation_experiments.py --datasets imdb dblp --models sage rgcn gat appnp \
+  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 --runs 10 --warmup 1 \
+  --ratio-search precise --device cuda --plot-dir ablation_results
 ```
 
 ## Rebuilding the C++ Kernel
@@ -148,7 +154,7 @@ Requirements: a C++14-compatible compiler (MSVC on Windows, GCC/Clang on Linux/m
 This work extends ideas from:
 
 > Sonali Raj, Manoj Kumar, Sumit Kumar, Ruchir Gupta, Amit Kumar Jaiswal.
-> "Graph Coarsening using Game Theoretic Approach." OpenReview, 2025.
+> "Graph Coarsening using Game Theoretic Approach." TMLR, 2026.
 > https://openreview.net/forum?id=5vLBjQJCln
 
 HCGC extends the original CGC algorithm to heterogeneous graphs

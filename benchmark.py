@@ -631,6 +631,77 @@ def load_acm(root):
 
     return data, 'paper'
 
+def load_acm3(root):
+    """Standard HAN-style 3-class ACM.
+
+    Papers published in {KDD, SIGMOD, SIGCOMM, MobiCOMM, VLDB} only,
+    mapped to 3 classes: 0=Data Mining (KDD), 1=Database (SIGMOD, VLDB),
+    2=Wireless Communication (SIGCOMM, MobiCOMM).
+    Reuses the ACM.mat downloaded by load_acm.
+    """
+    import scipy.io, scipy.sparse
+    from torch_geometric.data import HeteroData
+
+    mat_path = os.path.join(root, 'ACM_dgl', 'ACM.mat')
+    if not os.path.exists(mat_path):
+        load_acm(root)                    
+    mat = scipy.io.loadmat(mat_path)
+
+    conf_ids  = [0, 1, 9, 10, 13]   # KDD, SIGMOD, SIGCOMM, MobiCOMM, VLDB
+    label_ids = [0, 1, 2, 2, 1]     # DM,  DB,     Wireless, Wireless, DB
+
+    PvsC = scipy.sparse.csr_matrix(mat['PvsC'])
+    sel_cols = PvsC[:, conf_ids]
+    p_sel = np.asarray(sel_cols.sum(1)).flatten().nonzero()[0]
+    print(f" [ACM3] selected papers: {len(p_sel):,} / {PvsC.shape[0]:,}")
+
+    conf_local = sel_cols[p_sel].toarray().argmax(1)
+    labels = torch.from_numpy(np.array(label_ids)[conf_local].astype('int64'))
+
+    PvsA = scipy.sparse.csr_matrix(mat['PvsA'])[p_sel]
+    PvsT = scipy.sparse.csr_matrix(mat['PvsT'])[p_sel]
+    PvsP = scipy.sparse.csr_matrix(mat['PvsP'])[p_sel][:, p_sel]
+
+    a_keep = np.asarray(PvsA.sum(0)).flatten().nonzero()[0]
+    PvsA = PvsA[:, a_keep]
+    print(f" [ACM3] authors kept: {len(a_keep):,}  "
+          f"classes: {torch.bincount(labels).tolist()}")
+
+    def _ei(sp):
+        coo = sp.tocoo()
+        return torch.stack([torch.from_numpy(coo.row.astype('int64')),
+                            torch.from_numpy(coo.col.astype('int64'))])
+
+    data = HeteroData()
+    data['paper'].x = torch.from_numpy(PvsT.toarray()).float()
+    data['paper'].y = labels
+    data['paper'].num_nodes = len(p_sel)
+    data['author'].num_nodes = len(a_keep)
+
+    data[('paper', 'written_by', 'author')].edge_index = _ei(PvsA)
+    data[('author', 'writes', 'paper')].edge_index = _ei(PvsA).flip(0)
+    if PvsP.nnz > 0:
+        data[('paper', 'cites', 'paper')].edge_index = _ei(PvsP)
+
+    n_paper = len(p_sel)
+    gen = torch.Generator(); gen.manual_seed(42)
+    train = torch.zeros(n_paper, dtype=torch.bool)
+    val   = torch.zeros(n_paper, dtype=torch.bool)
+    test  = torch.zeros(n_paper, dtype=torch.bool)
+    for c in labels.unique(sorted=True).tolist():
+        idx = (labels == int(c)).nonzero(as_tuple=True)[0]
+        idx = idx[torch.randperm(len(idx), generator=gen)]
+        n_tr = min(200, max(1, len(idx) // 3))
+        n_va = min(100, max(1, (len(idx) - n_tr) // 4))
+        train[idx[:n_tr]] = True
+        val[idx[n_tr:n_tr + n_va]] = True
+        test[idx[n_tr + n_va:]] = True
+    data['paper'].train_mask = train
+    data['paper'].val_mask = val
+    data['paper'].test_mask = test
+    print(f" [ACM3] split {int(train.sum())}/{int(val.sum())}/{int(test.sum())}")
+
+    return data, 'paper'
 
 def load_freebase(root):
     """Load HGBn-Freebase: ~180k nodes, 8 types, 4 classes on book nodes.
