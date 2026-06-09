@@ -101,6 +101,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     if base_stats is not None:
         print(f"\nBaseline: reusing original-graph result "
               f"acc={base_stats['acc_mean']:.4f} +/- {base_stats['acc_std']:.4f} "
+              f"macro_f1={base_stats.get('macro_f1_mean', float('nan')):.4f} "
               f"t={base_stats['t_mean']:.1f}s")
     elif baseline:
         print(f"\nBaseline: training on original graph ({runs} runs) ...")
@@ -111,15 +112,27 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                                   train_epochs=train_epochs,
                                   train_hidden=train_hidden,
                                   mini_batch_size=mini_batch_size,
-                                  model_name=model_name)
-            base_recs.append({'test_acc': acc, 't_train': t})
-            print(f"t={t:.1f}s  test_acc={acc:.4f}")
+                                  model_name=model_name,
+                                  return_metrics=True)
+            base_recs.append({
+                'test_acc': acc['accuracy'],
+                'test_macro_f1': acc['macro_f1'],
+                'test_micro_f1': acc['micro_f1'],
+                't_train': t,
+            })
+            print(f"t={t:.1f}s  test_acc={acc['accuracy']:.4f}  "
+                  f"macro_f1={acc['macro_f1']:.4f}")
         base_stats = {
             'acc_mean': float(np.mean([r['test_acc'] for r in base_recs])),
             'acc_std':  float(np.std ([r['test_acc'] for r in base_recs])),
+            'macro_f1_mean': float(np.mean([r['test_macro_f1'] for r in base_recs])),
+            'macro_f1_std':  float(np.std ([r['test_macro_f1'] for r in base_recs])),
+            'micro_f1_mean': float(np.mean([r['test_micro_f1'] for r in base_recs])),
+            'micro_f1_std':  float(np.std ([r['test_micro_f1'] for r in base_recs])),
             't_mean':   float(np.mean([r['t_train']  for r in base_recs])),
         }
         print(f"  Baseline  acc={base_stats['acc_mean']:.4f} +/- {base_stats['acc_std']:.4f}"
+              f"  macro_f1={base_stats['macro_f1_mean']:.4f}"
               f"  t={base_stats['t_mean']:.1f}s")
 
     # ?? Warmup (once, for the first ratio) ???????????????????????????????????
@@ -200,8 +213,11 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
             )
             recs.append(r)
             print(f"comp={r['compression']:.2f}x  "
+                  f"edge_comp={r.get('edge_compression', float('nan')):.2f}x  "
+                  f"storage={r.get('storage_compression', float('nan')):.2f}x  "
                   f"t_total={r['t_total']:.1f}s  "
                   f"test_acc={r['test_acc']:.4f}  "
+                  f"macro_f1={r.get('test_macro_f1', float('nan')):.4f}  "
                   f"val_oracle={r.get('oracle_val_acc', float('nan')):.4f}  "
                   f"emb_d={r.get('target_emb_distortion', float('nan')):.4f}")
 
@@ -212,12 +228,24 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
             return float(np.nanmean(v)), float(np.nanstd(v))
 
         acc_m,  acc_s  = _s('test_acc')
+        mf1_m,  mf1_s  = _s('test_macro_f1')
+        mif1_m, mif1_s = _s('test_micro_f1')
         vo_m,   vo_s   = _s('oracle_val_acc')
         to_m,   to_s   = _s('oracle_acc')
         og_m,   og_s   = _s('oracle_gap')
         ed_m,   ed_s   = _s('target_emb_distortion')
         ec_m,   ec_s   = _s('target_emb_cosine')
+        node_ratio_m, node_ratio_s = _s('node_ratio')
+        edge_ratio_m, edge_ratio_s = _s('edge_ratio')
         comp_m, comp_s = _s('compression')
+        edge_comp_m, edge_comp_s = _s('edge_compression')
+        storage_comp_m, storage_comp_s = _s('storage_compression')
+        storage_ratio_m, storage_ratio_s = _s('storage_ratio')
+        storage_reduction_m, storage_reduction_s = _s('storage_reduction')
+        storage_orig_m, storage_orig_s = _s('storage_orig_bytes')
+        storage_cg_m, storage_cg_s = _s('storage_comp_graph_bytes')
+        storage_map_m, storage_map_s = _s('storage_map_bytes')
+        storage_bytes_m, storage_bytes_s = _s('storage_comp_bytes')
         tt_m,   tt_s   = _s('t_total')
         tc_m,   tc_s   = _s('t_compress')
         tr_m,   tr_s   = _s('t_train')
@@ -225,18 +253,36 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
         entry = {
             'ratio':    ratio,
             'acc_mean': acc_m, 'acc_std': acc_s,
+            'macro_f1_mean': mf1_m, 'macro_f1_std': mf1_s,
+            'micro_f1_mean': mif1_m, 'micro_f1_std': mif1_s,
             'val_oracle_mean': vo_m, 'val_oracle_std': vo_s,
             'oracle_mean': to_m, 'oracle_std': to_s,
             'oracle_gap_mean': og_m, 'oracle_gap_std': og_s,
             'emb_dist_mean': ed_m, 'emb_dist_std': ed_s,
             'emb_cos_mean': ec_m, 'emb_cos_std': ec_s,
+            'node_ratio_mean': node_ratio_m, 'node_ratio_std': node_ratio_s,
+            'edge_ratio_mean': edge_ratio_m, 'edge_ratio_std': edge_ratio_s,
             'comp_mean': comp_m,
+            'edge_comp_mean': edge_comp_m, 'edge_comp_std': edge_comp_s,
+            'storage_comp_mean': storage_comp_m, 'storage_comp_std': storage_comp_s,
+            'storage_ratio_mean': storage_ratio_m, 'storage_ratio_std': storage_ratio_s,
+            'storage_reduction_mean': storage_reduction_m,
+            'storage_reduction_std': storage_reduction_s,
+            'storage_orig_bytes_mean': storage_orig_m,
+            'storage_orig_bytes_std': storage_orig_s,
+            'storage_comp_graph_bytes_mean': storage_cg_m,
+            'storage_comp_graph_bytes_std': storage_cg_s,
+            'storage_map_bytes_mean': storage_map_m,
+            'storage_map_bytes_std': storage_map_s,
+            'storage_comp_bytes_mean': storage_bytes_m,
+            'storage_comp_bytes_std': storage_bytes_s,
             'tt_mean':  tt_m,  'tt_std':  tt_s,
             'tc_mean':  tc_m,
             'tr_mean':  tr_m,
         }
         if base_stats is not None:
             entry['acc_drop']      = acc_m - base_stats['acc_mean']
+            entry['macro_f1_drop'] = mf1_m - base_stats.get('macro_f1_mean', float('nan'))
             entry['train_speedup'] = base_stats['t_mean'] / max(tr_m, 1e-6)
         sweep.append(entry)
 
@@ -248,7 +294,7 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
 # ?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧?먥븧
 
 def print_sweep_table(base_stats, sweep, dataset):
-    W = 68
+    W = 90
     print(f"\n{'='*W}")
     print(f"  SWEEP RESULTS   dataset={dataset}   ({len(sweep)} ratios)")
     print(f"{'='*W}")
@@ -257,34 +303,36 @@ def print_sweep_table(base_stats, sweep, dataset):
 
     # header
     if has_base:
-        print(f"  {'ratio':>6}  {'compr.':>7}  {'test_acc':>14}  "
+        print(f"  {'ratio':>6}  {'node':>7}  {'edge':>7}  {'storage':>8}  {'test_acc':>14}  "
               f"{'val_orcl':>8}  {'emb_d':>7}  {'drop':>7}  "
               f"{'speedup':>8}  {'t_total':>9}")
-        print("  " + "-" * 88)
-        print(f"  {'baseline':>6}  {'  1.00x':>7}  "
+        print("  " + "-" * 110)
+        print(f"  {'baseline':>6}  {'  1.00x':>7}  {'  1.00x':>7}  {'  1.00x':>8}  "
               f"{base_stats['acc_mean']:>7.4f}+/-{base_stats['acc_std']:.4f}  "
               f"{'n/a':>8}  {'n/a':>7}  {'n/a':>7}  {'  1.00x':>8}  "
               f"{base_stats['t_mean']:>8.1f}s")
-        print("  " + "-" * 88)
+        print("  " + "-" * 110)
     else:
-        print(f"  {'ratio':>6}  {'compr.':>7}  {'test_acc':>14}  "
+        print(f"  {'ratio':>6}  {'node':>7}  {'edge':>7}  {'storage':>8}  {'test_acc':>14}  "
               f"{'val_orcl':>8}  {'emb_d':>7}  {'t_total':>9}")
-        print("  " + "-" * 68)
+        print("  " + "-" * 90)
 
     for e in sweep:
         acc_str  = f"{e['acc_mean']:.4f}+/-{e['acc_std']:.4f}"
         comp_str = f"{e['comp_mean']:5.2f}x"
+        edge_str = f"{e.get('edge_comp_mean', float('nan')):5.2f}x"
+        storage_str = f"{e.get('storage_comp_mean', float('nan')):6.2f}x"
         vo_str   = f"{e.get('val_oracle_mean', float('nan')):.4f}"
         ed_str   = f"{e.get('emb_dist_mean', float('nan')):.4f}"
         tt_str   = f"{e['tt_mean']:7.1f}s"
         if has_base:
             drop_str = f"{e['acc_drop']:+.4f}"
             su_str   = f"{e['train_speedup']:6.1f}x"
-            print(f"  {e['ratio']:>6.2f}  {comp_str:>7}  {acc_str:>14}  "
+            print(f"  {e['ratio']:>6.2f}  {comp_str:>7}  {edge_str:>7}  {storage_str:>8}  {acc_str:>14}  "
                   f"{vo_str:>8}  {ed_str:>7}  {drop_str:>7}  "
                   f"{su_str:>8}  {tt_str:>9}")
         else:
-            print(f"  {e['ratio']:>6.2f}  {comp_str:>7}  {acc_str:>14}  "
+            print(f"  {e['ratio']:>6.2f}  {comp_str:>7}  {edge_str:>7}  {storage_str:>8}  {acc_str:>14}  "
                   f"{vo_str:>8}  {ed_str:>7}  {tt_str:>9}")
 
     print(f"{'='*W}\n")
@@ -316,6 +364,10 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc',
     payload = {
         'x': x.tolist(),
         'acc': arr('acc_mean').tolist(),
+        'macro_f1': arr('macro_f1_mean').tolist(),
+        'edge_compression': arr('edge_comp_mean').tolist(),
+        'storage_compression': arr('storage_comp_mean').tolist(),
+        'storage_reduction': arr('storage_reduction_mean').tolist(),
         'val_oracle': arr('val_oracle_mean').tolist(),
         'test_oracle': arr('oracle_mean').tolist(),
         'emb_dist': arr('emb_dist_mean').tolist(),
@@ -329,8 +381,12 @@ def save_sweep_plot(sweep, dataset, model_name, plot_dir, compressor='hcgc',
     with csv_path.open('w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['compression', 'test_acc', 'val_oracle',
+                         'test_macro_f1', 'edge_compression',
+                         'storage_compression', 'storage_reduction',
                          'test_oracle', 'emb_dist'])
         for row in zip(payload['x'], payload['acc'], payload['val_oracle'],
+                       payload['macro_f1'], payload['edge_compression'],
+                       payload['storage_compression'], payload['storage_reduction'],
                        payload['test_oracle'], payload['emb_dist']):
             writer.writerow(row)
     print(f"  [plot] saved data {csv_path}")
@@ -373,14 +429,14 @@ plt.close(fig)
 
 
 def print_compressor_table(all_results, dataset, models, compressors):
-    W = 104
+    W = 126
     print(f"\n{'='*W}")
     print(f"  COMPRESSOR COMPARISON   dataset={dataset}")
     print(f"{'='*W}")
-    print(f"  {'model':>8}  {'compressor':>12}  {'ratio':>6}  {'compr.':>7}  "
-          f"{'test_acc':>14}  {'drop':>8}  {'val_orcl':>8}  "
+    print(f"  {'model':>8}  {'compressor':>12}  {'ratio':>6}  {'node':>7}  "
+          f"{'edge':>7}  {'storage':>8}  {'test_acc':>14}  {'drop':>8}  {'val_orcl':>8}  "
           f"{'emb_d':>7}  {'t_total':>9}")
-    print("  " + "-" * 100)
+    print("  " + "-" * 122)
 
     for model_name in models:
         for compressor in compressors:
@@ -391,6 +447,8 @@ def print_compressor_table(all_results, dataset, models, compressors):
                 drop_str = 'n/a' if np.isnan(drop) else f"{drop:+.4f}"
                 print(f"  {model_name:>8}  {compressor:>12}  "
                       f"{e['ratio']:>6.2f}  {e['comp_mean']:>6.2f}x  "
+                      f"{e.get('edge_comp_mean', float('nan')):>6.2f}x  "
+                      f"{e.get('storage_comp_mean', float('nan')):>7.2f}x  "
                       f"{acc:>14}  {drop_str:>8}  "
                       f"{e.get('val_oracle_mean', float('nan')):>8.4f}  "
                       f"{e.get('emb_dist_mean', float('nan')):>7.4f}  "
@@ -430,9 +488,25 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
                     'merge_objective': merge_objective,
                     'ratio': e['ratio'],
                     'compression': e['comp_mean'],
+                    'node_compression': e['comp_mean'],
+                    'node_ratio': e.get('node_ratio_mean', float('nan')),
+                    'edge_compression': e.get('edge_comp_mean', float('nan')),
+                    'edge_ratio': e.get('edge_ratio_mean', float('nan')),
+                    'storage_compression': e.get('storage_comp_mean', float('nan')),
+                    'storage_ratio': e.get('storage_ratio_mean', float('nan')),
+                    'storage_reduction': e.get('storage_reduction_mean', float('nan')),
+                    'storage_orig_bytes': e.get('storage_orig_bytes_mean', float('nan')),
+                    'storage_comp_bytes': e.get('storage_comp_bytes_mean', float('nan')),
+                    'storage_comp_graph_bytes': e.get('storage_comp_graph_bytes_mean', float('nan')),
+                    'storage_map_bytes': e.get('storage_map_bytes_mean', float('nan')),
                     'test_acc_mean': e['acc_mean'],
                     'test_acc_std': e['acc_std'],
+                    'test_macro_f1_mean': e.get('macro_f1_mean', float('nan')),
+                    'test_macro_f1_std': e.get('macro_f1_std', float('nan')),
+                    'test_micro_f1_mean': e.get('micro_f1_mean', float('nan')),
+                    'test_micro_f1_std': e.get('micro_f1_std', float('nan')),
                     'acc_drop': e.get('acc_drop', float('nan')),
+                    'macro_f1_drop': e.get('macro_f1_drop', float('nan')),
                     'val_oracle': e.get('val_oracle_mean', float('nan')),
                     'test_oracle': e.get('oracle_mean', float('nan')),
                     'emb_dist': e.get('emb_dist_mean', float('nan')),
@@ -447,6 +521,12 @@ def save_comparison_outputs(all_results, dataset, models, compressors,
                     'baseline_acc_std': (
                         base_stats['acc_std'] if base_stats is not None
                         else float('nan')),
+                    'baseline_macro_f1_mean': (
+                        base_stats.get('macro_f1_mean', float('nan'))
+                        if base_stats is not None else float('nan')),
+                    'baseline_macro_f1_std': (
+                        base_stats.get('macro_f1_std', float('nan'))
+                        if base_stats is not None else float('nan')),
                     'baseline_t_train': (
                         base_stats['t_mean'] if base_stats is not None
                         else float('nan')),

@@ -1087,6 +1087,93 @@ def _build_downstream_model(data, target_type, model_name, hidden, num_classes,
 _FULL_BATCH_NODE_LIMIT = 100_000
 
 
+def _classification_metrics(y_true, y_pred, num_classes=None):
+    """Return accuracy and single-label macro/micro F1 for valid labels."""
+    y_true = y_true.detach().cpu().long()
+    y_pred = y_pred.detach().cpu().long()
+    valid = y_true >= 0
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
+
+    n = int(y_true.numel())
+    if n == 0:
+        return {
+            'accuracy': float('nan'),
+            'macro_f1': float('nan'),
+            'micro_f1': float('nan'),
+            'support': 0,
+        }
+
+    if num_classes is None:
+        max_true = int(y_true.max().item()) if y_true.numel() else -1
+        max_pred = int(y_pred.max().item()) if y_pred.numel() else -1
+        num_classes = max(max_true, max_pred) + 1
+    num_classes = int(max(num_classes, 1))
+
+    correct = (y_pred == y_true)
+    acc = float(correct.float().mean().item())
+
+    f1s = []
+    for cls in range(num_classes):
+        true_c = y_true == cls
+        support = int(true_c.sum().item())
+        if support == 0:
+            continue
+        pred_c = y_pred == cls
+        tp = int((pred_c & true_c).sum().item())
+        fp = int((pred_c & ~true_c).sum().item())
+        fn = int((~pred_c & true_c).sum().item())
+        denom = 2 * tp + fp + fn
+        f1s.append((2 * tp / denom) if denom > 0 else 0.0)
+
+    macro_f1 = float(np.mean(f1s)) if f1s else float('nan')
+
+    tp_total = int(correct.sum().item())
+    fp_total = n - tp_total
+    fn_total = n - tp_total
+    micro_den = 2 * tp_total + fp_total + fn_total
+    micro_f1 = float(2 * tp_total / micro_den) if micro_den > 0 else float('nan')
+
+    return {
+        'accuracy': acc,
+        'macro_f1': macro_f1,
+        'micro_f1': micro_f1,
+        'support': n,
+    }
+
+
+def _tensor_storage_bytes(value):
+    if not torch.is_tensor(value):
+        return 0
+    if value.is_sparse:
+        value = value.coalesce()
+        return _tensor_storage_bytes(value.indices()) + _tensor_storage_bytes(value.values())
+    return int(value.numel() * value.element_size())
+
+
+def _heterodata_storage_bytes(hdata):
+    """Approximate in-memory graph storage as the sum of tensor payload bytes."""
+    total = 0
+    stores = []
+    if hasattr(hdata, 'node_stores'):
+        stores.extend(hdata.node_stores)
+    if hasattr(hdata, 'edge_stores'):
+        stores.extend(hdata.edge_stores)
+    if not stores and hasattr(hdata, 'stores'):
+        stores.extend(hdata.stores)
+
+    for store in stores:
+        for _, value in store.items():
+            total += _tensor_storage_bytes(value)
+    return int(total)
+
+
+def _node_map_storage_bytes(node_map):
+    if not node_map:
+        return 0
+    return int(sum(_tensor_storage_bytes(v) for v in node_map.values()))
+
+
 def _resplit_supernodes(data, target_type, orig_data=None, seed=0):
     """Re-split compressed-graph supernodes to match original train/val/test ratios.
 
@@ -1145,7 +1232,8 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                                   model_name='sage',
                                   orig_data=None, node_map=None,
                                   use_soft_labels=False,
-                                  use_edge_weights=False):
+                                  use_edge_weights=False,
+                                  return_metrics=False):
     """Mini-batch HeteroSAGE training via NeighborLoader.
 
     Used automatically by train_on_heterodata when the graph has more than
@@ -1273,6 +1361,30 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                 total   += valid.sum().item()
         return correct / max(total, 1)
 
+    def _eval_metrics(loader):
+        preds_all = []
+        labels_all = []
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(dev)
+                out   = model(batch.x_dict, batch.edge_index_dict, target_type,
+                              _edge_weight_dict(batch)) if use_edge_weights else \
+                        model(batch.x_dict, batch.edge_index_dict, target_type)
+                n     = batch[target_type].batch_size
+                pred  = out[:n].argmax(dim=1).cpu()
+                lbl   = batch[target_type].y[:n].cpu()
+                valid = lbl >= 0
+                if valid.any():
+                    preds_all.append(pred[valid])
+                    labels_all.append(lbl[valid])
+        if not labels_all:
+            return _classification_metrics(torch.empty(0, dtype=torch.long),
+                                           torch.empty(0, dtype=torch.long),
+                                           num_classes=num_classes)
+        return _classification_metrics(torch.cat(labels_all),
+                                       torch.cat(preds_all),
+                                       num_classes=num_classes)
+
     best_val, best_test = 0.0, 0.0
     best_state          = None
     no_improve          = 0
@@ -1386,9 +1498,14 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         te_mask   = orig_data[target_type].test_mask
         y_orig    = orig_data[target_type].y[te_mask]
         super_idx = nm[te_mask]                      # which supernode each orig test node belongs to
-        orig_acc  = (preds[super_idx] == y_orig).float().mean().item()
-        return orig_acc, elapsed
+        metrics   = _classification_metrics(y_orig, preds[super_idx],
+                                            num_classes=num_classes)
+        if return_metrics:
+            return metrics, elapsed
+        return metrics['accuracy'], elapsed
 
+    if return_metrics:
+        return _eval_metrics(test_loader), elapsed
     return best_test, elapsed
 
 
@@ -1398,7 +1515,8 @@ def train_on_heterodata(data, target_type, device_str,
                         orig_data=None, node_map=None,
                         force_full_batch=False,
                         use_soft_labels=False,
-                        use_edge_weights=False):
+                        use_edge_weights=False,
+                        return_metrics=False):
     """Train a 2-layer HeteroSAGE on any HeteroData object.
 
     Automatically switches to mini-batch (NeighborLoader) mode when the
@@ -1427,6 +1545,7 @@ def train_on_heterodata(data, target_type, device_str,
             orig_data=orig_data, node_map=node_map,
             use_soft_labels=use_soft_labels,
             use_edge_weights=use_edge_weights,
+            return_metrics=return_metrics,
         )
 
     dev = torch.device(
@@ -1567,9 +1686,23 @@ def train_on_heterodata(data, target_type, device_str,
         y_orig    = orig_data[target_type].y[te_mask]
         super_idx = nm[te_mask].to(dev)
         pred      = out[super_idx].argmax(1).cpu()
-        orig_acc  = (pred == y_orig).float().mean().item()
-        return orig_acc, elapsed
+        metrics   = _classification_metrics(y_orig, pred, num_classes=num_classes)
+        if return_metrics:
+            return metrics, elapsed
+        return metrics['accuracy'], elapsed
 
+    if return_metrics:
+        model.eval()
+        with torch.no_grad():
+            out = model(cdata.x_dict, cdata.edge_index_dict, target_type,
+                        edge_weight_dict) if use_edge_weights else \
+                  model(cdata.x_dict, cdata.edge_index_dict, target_type)
+        y = cdata[target_type].y
+        mask = cdata[target_type].test_mask & (y >= 0)
+        metrics = _classification_metrics(y[mask].cpu(),
+                                          out.argmax(dim=1)[mask].cpu(),
+                                          num_classes=num_classes)
+        return metrics, elapsed
     return best_test, elapsed
 
 
@@ -1579,7 +1712,8 @@ def train_downstream(result, orig_data, target_type, device_str,
                      force_full_batch=False,
                      eval_protocol='original',
                      use_soft_labels=False,
-                     use_edge_weights=False):
+                     use_edge_weights=False,
+                     return_metrics=False):
     """Train on a compressed HCGCResult.
 
     eval_protocol='original' maps predictions back to original test-node labels
@@ -1598,7 +1732,8 @@ def train_downstream(result, orig_data, target_type, device_str,
                                orig_data=eval_orig, node_map=eval_map,
                                force_full_batch=force_full_batch,
                                use_soft_labels=use_soft_labels,
-                               use_edge_weights=use_edge_weights)
+                               use_edge_weights=use_edge_weights,
+                               return_metrics=return_metrics)
 
 
 def oracle_upper_bound(result, orig_data, target_type, mask_name='test_mask'):
@@ -1653,8 +1788,9 @@ def oracle_upper_bound(result, orig_data, target_type, mask_name='test_mask'):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
-                 mini_batch_size=512, model_name='sage', force_full_batch=False):
-    """Train on the original (uncompressed) graph. Returns (test_acc, elapsed).
+                 mini_batch_size=512, model_name='sage', force_full_batch=False,
+                 return_metrics=False):
+    """Train on the original graph. Returns (test_acc, elapsed) by default.
 
     Uses a generous patience (= train_epochs // 5) so the model trains until
     genuine convergence rather than stopping at an early local plateau.
@@ -1665,7 +1801,8 @@ def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
                                patience=train_epochs // 5,
                                mini_batch_size=mini_batch_size,
                                model_name=model_name,
-                               force_full_batch=force_full_batch)
+                               force_full_batch=force_full_batch,
+                               return_metrics=return_metrics)
 
 
 def run_once(data, target_type, ratio, device, pretrain,
@@ -1771,7 +1908,7 @@ def run_once(data, target_type, ratio, device, pretrain,
     # ── Downstream training ───────────────────────────────────────────────────
     # Default evaluation maps predictions back to original node labels; the
     # legacy supernode protocol is available through --eval-protocol supernode.
-    test_acc, t_train = train_downstream(
+    test_metrics, t_train = train_downstream(
         result, data, target_type,
         device_str       = device,
         epochs           = train_epochs,
@@ -1783,22 +1920,40 @@ def run_once(data, target_type, ratio, device, pretrain,
         eval_protocol    = eval_protocol,
         use_soft_labels  = use_soft_labels,
         use_edge_weights = str(edge_weight_mode or 'binary').lower() != 'binary',
+        return_metrics   = True,
     )
+    test_acc = test_metrics['accuracy']
 
     n_orig = result.info['n_nodes_orig']
     n_comp = result.info['n_nodes_comp']
     e_orig = result.info['edges_orig']
     e_comp = result.info['edges_comp']
+    storage_orig = _heterodata_storage_bytes(data)
+    storage_comp_graph = _heterodata_storage_bytes(result.data)
+    storage_map = _node_map_storage_bytes(result.node_map)
+    storage_comp = storage_comp_graph + storage_map
 
     return {
         'node_ratio':   n_comp / max(n_orig, 1),           # retention: smaller = more compressed
         'edge_ratio':   e_comp / max(e_orig, 1),
         'compression':  result.info['compression'],        # n_orig / n_comp (e.g. 10.3x)
+        'node_compression': result.info['compression'],
+        'edge_compression': e_orig / max(e_comp, 1),
+        'storage_orig_bytes': storage_orig,
+        'storage_comp_graph_bytes': storage_comp_graph,
+        'storage_map_bytes': storage_map,
+        'storage_comp_bytes': storage_comp,
+        'storage_ratio': storage_comp / max(storage_orig, 1),
+        'storage_compression': storage_orig / max(storage_comp, 1),
+        'storage_reduction': 1.0 - (storage_comp / max(storage_orig, 1)),
         't_compress':   t_compress,                        # hcgc.compress() wall time (pretrain + coarsen)
         't_coarsen':    result.info['coarsen_time'],       # C++ kernel only
         't_train':      t_train,
         't_total':      t_compress + t_train,
         'test_acc':     test_acc,
+        'test_macro_f1': test_metrics['macro_f1'],
+        'test_micro_f1': test_metrics['micro_f1'],
+        'test_support':  test_metrics['support'],
         'oracle_acc':   oracle['oracle_acc'],
         'oracle_val_acc': oracle_val['oracle_acc'],
         'oracle_gap':   oracle['oracle_acc'] - test_acc,
@@ -1823,6 +1978,14 @@ def run_once(data, target_type, ratio, device, pretrain,
 
 def _fmt(mean, std, fmt='.3f'):
     return f"{mean:{fmt}} ± {std:{fmt}}"
+
+
+def _fmt_bytes(num_bytes):
+    num = float(num_bytes)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(num) < 1024.0 or unit == 'TB':
+            return f"{num:.1f} {unit}"
+        num /= 1024.0
 
 
 def main():
@@ -2005,9 +2168,16 @@ def main():
                                   train_hidden=args.train_hidden,
                                   mini_batch_size=args.mini_batch_size,
                                   model_name=args.model,
-                                  force_full_batch=args.force_full_batch)
-            base_records.append({'t_train': t, 'test_acc': acc})
-            print(f"t={t:.1f}s  test_acc={acc:.4f}")
+                                  force_full_batch=args.force_full_batch,
+                                  return_metrics=True)
+            base_records.append({
+                't_train': t,
+                'test_acc': acc['accuracy'],
+                'test_macro_f1': acc['macro_f1'],
+                'test_micro_f1': acc['micro_f1'],
+            })
+            print(f"t={t:.1f}s  test_acc={acc['accuracy']:.4f}  "
+                  f"macro_f1={acc['macro_f1']:.4f}")
 
     # ── Warmup ────────────────────────────────────────────────────────────────
     # Two JIT sources need flushing before measurement:
@@ -2118,6 +2288,8 @@ def main():
             f"edge_ratio={r['edge_ratio']:.3f}  "
             f"t_total={r['t_total']:.1f}s  "
             f"test_acc={r['test_acc']:.4f}  "
+            f"macro_f1={r['test_macro_f1']:.4f}  "
+            f"storage={r['storage_compression']:.2f}x  "
             f"oracle={r['oracle_acc']:.4f}"
         )
 
@@ -2133,16 +2305,22 @@ def main():
     node_m, node_s = stat('node_ratio')
     edge_m, edge_s = stat('edge_ratio')
     comp_m, comp_s = stat('compression')
-    # Effective (edge-based) compression: GNN training cost scales with |E|,
-    # so edge compression is the primary driver of training speedup.
-    edge_comp_m = 1.0 / max(edge_m, 1e-9)
-    edge_comp_s = edge_comp_m * (edge_s / max(edge_m, 1e-9))
+    edge_comp_m, edge_comp_s = stat('edge_compression')
+    storage_comp_m, storage_comp_s = stat('storage_compression')
+    storage_ratio_m, storage_ratio_s = stat('storage_ratio')
+    storage_reduction_m, storage_reduction_s = stat('storage_reduction')
+    storage_orig_m, _ = stat('storage_orig_bytes')
+    storage_cg_m, _ = stat('storage_comp_graph_bytes')
+    storage_map_m, _ = stat('storage_map_bytes')
+    storage_comp_bytes_m, _ = stat('storage_comp_bytes')
 
     tc_m,  tc_s  = stat('t_compress')
     tco_m, tco_s = stat('t_coarsen')
     tt_m,  tt_s  = stat('t_train')
     tot_m, tot_s = stat('t_total')
     acc_m, acc_s = stat('test_acc')
+    mf1_m, mf1_s = stat('test_macro_f1')
+    mif1_m, mif1_s = stat('test_micro_f1')
     oracle_m, oracle_s = stat('oracle_acc')
     voracle_m, voracle_s = stat('oracle_val_acc')
     ogap_m, ogap_s = stat('oracle_gap')
@@ -2164,6 +2342,12 @@ def main():
           f"  (node ratio {node_m:.3f} ± {node_s:.3f})")
     print(f"  {'Edge compression (actual)':<28}: {edge_comp_m:.2f}x ± {edge_comp_s:.2f}x"
           f"  (edge ratio {edge_m:.3f} ± {edge_s:.3f})")
+    print(f"  {'Storage compression':<28}: {storage_comp_m:.2f}x ± {storage_comp_s:.2f}x"
+          f"  (ratio {storage_ratio_m:.3f} ± {storage_ratio_s:.3f}, "
+          f"reduction {storage_reduction_m*100:.1f}% ± {storage_reduction_s*100:.1f}%)")
+    print(f"  {'Storage bytes':<28}: {_fmt_bytes(storage_orig_m)} -> "
+          f"{_fmt_bytes(storage_comp_bytes_m)} "
+          f"(graph {_fmt_bytes(storage_cg_m)} + map {_fmt_bytes(storage_map_m)})")
     print()
     print(f"  {'Time  compress() total':<28}: {_fmt(tc_m,  tc_s,  '.1f')} s"
           f"  (coarsen kernel: {tco_m:.1f} ± {tco_s:.1f} s)")
@@ -2171,6 +2355,8 @@ def main():
     print(f"  {'Time  total':<28}: {_fmt(tot_m, tot_s, '.1f')} s")
     print()
     print(f"  {'Test accuracy':<28}: {_fmt(acc_m, acc_s, '.4f')}")
+    print(f"  {'Test macro-F1':<28}: {_fmt(mf1_m, mf1_s, '.4f')}")
+    print(f"  {'Test micro-F1':<28}: {_fmt(mif1_m, mif1_s, '.4f')}")
     print(f"  {'Val oracle bound':<28}: {_fmt(voracle_m, voracle_s, '.4f')}")
     print(f"  {'Oracle upper bound':<28}: {_fmt(oracle_m, oracle_s, '.4f')}"
           f"  (gap {ogap_m:+.4f} 짹 {ogap_s:.4f})")
@@ -2185,6 +2371,7 @@ def main():
         b_t_s  = float(np.std ([r['t_train']  for r in base_records]))
         b_acc_m = float(np.mean([r['test_acc'] for r in base_records]))
         b_acc_s = float(np.std ([r['test_acc'] for r in base_records]))
+        b_mf1_m = float(np.mean([r['test_macro_f1'] for r in base_records]))
 
         train_speedup = b_t_m / max(tt_m, 1e-6)
         total_speedup = b_t_m / max(tot_m, 1e-6)
@@ -2202,6 +2389,7 @@ def main():
               f"  ({total_speedup:.2f}x)")
         print(f"  {'Test accuracy':<28}  {b_acc_m:>10.4f}  {acc_m:>10.4f}"
               f"  ({acc_drop:+.4f},  {acc_retention*100:.1f}% retained)")
+        print(f"  {'Test macro-F1':<28}  {b_mf1_m:>10.4f}  {mf1_m:>10.4f}")
 
     print(f"{'='*W}\n")
 

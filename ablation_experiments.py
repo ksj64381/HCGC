@@ -111,9 +111,23 @@ ROW_FIELDS = [
     "variant_label",
     "ratio",
     "compression",
+    "node_compression",
+    "node_ratio",
+    "edge_compression",
+    "edge_ratio",
+    "storage_compression",
+    "storage_ratio",
+    "storage_reduction",
+    "storage_orig_bytes",
+    "storage_comp_bytes",
+    "storage_comp_graph_bytes",
+    "storage_map_bytes",
     "test_acc_mean",
     "test_acc_std",
+    "test_macro_f1_mean",
+    "test_macro_f1_std",
     "acc_drop",
+    "macro_f1_drop",
     "val_oracle",
     "test_oracle",
     "emb_dist",
@@ -124,6 +138,8 @@ ROW_FIELDS = [
     "train_speedup",
     "baseline_acc_mean",
     "baseline_acc_std",
+    "baseline_macro_f1_mean",
+    "baseline_macro_f1_std",
     "baseline_t_train",
     "ratio_search",
     "merge_objective",
@@ -215,10 +231,14 @@ def _variant_config(name, args):
 def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
     base_acc = float("nan")
     base_std = float("nan")
+    base_macro = float("nan")
+    base_macro_std = float("nan")
     base_time = float("nan")
     if base_stats is not None:
         base_acc = base_stats.get("acc_mean", float("nan"))
         base_std = base_stats.get("acc_std", float("nan"))
+        base_macro = base_stats.get("macro_f1_mean", float("nan"))
+        base_macro_std = base_stats.get("macro_f1_std", float("nan"))
         base_time = base_stats.get("t_mean", float("nan"))
 
     flags = {
@@ -243,9 +263,23 @@ def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
         "variant_label": VARIANTS[variant]["label"],
         "ratio": entry["ratio"],
         "compression": entry["comp_mean"],
+        "node_compression": entry["comp_mean"],
+        "node_ratio": entry.get("node_ratio_mean", float("nan")),
+        "edge_compression": entry.get("edge_comp_mean", float("nan")),
+        "edge_ratio": entry.get("edge_ratio_mean", float("nan")),
+        "storage_compression": entry.get("storage_comp_mean", float("nan")),
+        "storage_ratio": entry.get("storage_ratio_mean", float("nan")),
+        "storage_reduction": entry.get("storage_reduction_mean", float("nan")),
+        "storage_orig_bytes": entry.get("storage_orig_bytes_mean", float("nan")),
+        "storage_comp_bytes": entry.get("storage_comp_bytes_mean", float("nan")),
+        "storage_comp_graph_bytes": entry.get("storage_comp_graph_bytes_mean", float("nan")),
+        "storage_map_bytes": entry.get("storage_map_bytes_mean", float("nan")),
         "test_acc_mean": entry["acc_mean"],
         "test_acc_std": entry["acc_std"],
+        "test_macro_f1_mean": entry.get("macro_f1_mean", float("nan")),
+        "test_macro_f1_std": entry.get("macro_f1_std", float("nan")),
         "acc_drop": entry.get("acc_drop", float("nan")),
+        "macro_f1_drop": entry.get("macro_f1_drop", float("nan")),
         "val_oracle": entry.get("val_oracle_mean", float("nan")),
         "test_oracle": entry.get("oracle_mean", float("nan")),
         "emb_dist": entry.get("emb_dist_mean", float("nan")),
@@ -256,6 +290,8 @@ def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
         "train_speedup": entry.get("train_speedup", float("nan")),
         "baseline_acc_mean": base_acc,
         "baseline_acc_std": base_std,
+        "baseline_macro_f1_mean": base_macro,
+        "baseline_macro_f1_std": base_macro_std,
         "baseline_t_train": base_time,
         "ratio_search": args.ratio_search,
         "merge_objective": cfg["merge_objective"],
