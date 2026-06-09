@@ -846,6 +846,7 @@ LOADERS = {
     'ogbn-mag':  load_ogbn_mag,
     'aminer':    load_aminer,
     'acm':       load_acm,
+    'acm3':      load_acm3,
     'freebase':  load_freebase,
 }
 
