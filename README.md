@@ -1,6 +1,6 @@
 # HCGC: Heterogeneous Graph Coarsening via Coalition Games
 
-"A 10× compressed graph typically trains 5–8× faster per run; accuracy retention depends on the dataset and compression ratio (see the paper for full results)."
+A 10× compressed graph typically trains 5–8× faster per run; accuracy retention depends on the dataset and compression ratio (see the paper for full results).
 
 ## Quick Start
 
