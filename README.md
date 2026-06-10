@@ -123,7 +123,7 @@ result = hcgc.compress(data, ratio=0.1, target_type='paper')
 Main results (Tables I–II, Fig. 3):
 
 ```bash
-python experiments.py --dataset imdb dblp acm \
+python experiments.py --dataset imdb dblp acm3 \
   --models sage rgcn gat appnp \
   --compressors hcgc freehgc cgc_homo random_type ahugc_style \
   --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
