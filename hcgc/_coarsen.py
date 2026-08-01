@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 
 from hcgc._config import _CFG
+from hcgc._edge_utils import flatten_undirected_edge_groups
 
 try:
     import hcgc_module
@@ -44,8 +45,13 @@ except ImportError:
 # Flat array extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_flat_arrays(data, l2_normalize=True):
-    """Convert HeteroData to flat numpy arrays expected by the C++ kernel."""
+def extract_flat_arrays(data, l2_normalize=True, return_edge_stats=False):
+    """Convert HeteroData to flat numpy arrays expected by the C++ kernel.
+
+    The C++ kernel treats each supplied edge as an undirected pair and inserts
+    both CSR directions. Typed relations are therefore canonicalized and
+    deduplicated here instead of being explicitly mirrored in Python.
+    """
     offsets, feats_list, feat_dims, boundaries = {}, [], [], []
     cur = 0
     for nt in _CFG.node_types:
@@ -65,21 +71,22 @@ def extract_flat_arrays(data, l2_normalize=True):
     type_boundaries = np.array(boundaries, dtype=np.int32)
     feature_dims    = np.array(feat_dims,  dtype=np.int32)
 
-    src_list, dst_list = [], []
+    edge_groups = []
     for et in data.edge_types:
         s_type, _, d_type = et
         if s_type not in offsets or d_type not in offsets:
             continue
-        ei = data[et].edge_index.numpy()
-        src_list.append(ei[0] + offsets[s_type])
-        dst_list.append(ei[1] + offsets[d_type])
-        src_list.append(ei[1] + offsets[d_type])
-        dst_list.append(ei[0] + offsets[s_type])
+        ei = data[et].edge_index.detach().cpu().numpy()
+        edge_groups.append((s_type, d_type, ei))
 
-    src_nodes = np.concatenate(src_list).astype(np.int32)
-    dst_nodes = np.concatenate(dst_list).astype(np.int32)
+    src_nodes, dst_nodes, edge_stats = flatten_undirected_edge_groups(
+        edge_groups, offsets, int(type_boundaries[-1]))
     weights   = np.ones(len(src_nodes), dtype=np.float32)
-    return src_nodes, dst_nodes, weights, all_features, type_boundaries, feature_dims, offsets
+    result = (src_nodes, dst_nodes, weights, all_features,
+              type_boundaries, feature_dims, offsets)
+    if return_edge_stats:
+        return result + (edge_stats,)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════

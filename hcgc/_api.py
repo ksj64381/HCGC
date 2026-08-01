@@ -211,6 +211,12 @@ def compress(
     ctx = _load_and_pretrain(data, args)
     if verbose:
         print(f"[HCGC] load_and_pretrain:    {time.perf_counter()-_t:.2f}s")
+        edge_stats = ctx['edge_input_stats']
+        print("[HCGC] coarsening adjacency: "
+              f"{edge_stats['input_edge_entries']:,} typed entries -> "
+              f"{edge_stats['unique_undirected_edges']:,} unique undirected edges "
+              f"({edge_stats['duplicate_entries_removed']:,} duplicate entries and "
+              f"{edge_stats['self_loops_removed']:,} self-loops removed)")
 
     # ── Auto-coarsen ──────────────────────────────────────────────────────────
     _t = time.perf_counter()
@@ -256,6 +262,7 @@ def compress(
         'auto_target_tolerance': float(auto_target_tolerance),
         'target_emb_distortion': emb_diag['distortion'],
         'target_emb_cosine': emb_diag['cosine'],
+        'coarsening_edge_input': dict(ctx['edge_input_stats']),
     }
 
     if verbose:

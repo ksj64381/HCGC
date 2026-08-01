@@ -124,10 +124,12 @@ def _load_and_pretrain(data, args):
 
     Returns a context dict reusable across multiple coarsening runs.
     """
-    src_nodes, dst_nodes, weights, all_features, type_boundaries, feature_dims, offsets = \
+    (src_nodes, dst_nodes, weights, all_features, type_boundaries,
+     feature_dims, offsets, edge_input_stats) = \
         extract_flat_arrays(
             data,
             l2_normalize=getattr(args, 'coarsen_l2_normalize', True),
+            return_edge_stats=True,
         )
 
     emb_dict = None
@@ -210,6 +212,7 @@ def _load_and_pretrain(data, args):
         src_nodes=src_nodes, dst_nodes=dst_nodes, weights=weights,
         all_features=all_features, type_boundaries=type_boundaries,
         feature_dims=feature_dims, offsets=offsets,
+        edge_input_stats=edge_input_stats,
         emb_dict=emb_dict,
         coarsen_features=coarsen_features,
         coarsen_feat_dims=coarsen_feat_dims,

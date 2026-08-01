@@ -231,6 +231,8 @@ struct CSRGraph {
 
   void build_from_edgelist(int n, const int *src, const int *dst,
                            const float *weights, int num_edges) {
+    // Each input row represents one undirected pair. Expand it to the two CSR
+    // directions here; callers must not pre-expand reciprocal entries.
     num_nodes = n;
     node_ptr.assign(num_nodes + 1, 0);
     edge_dst.resize(num_edges * 2);
