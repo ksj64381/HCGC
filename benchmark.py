@@ -1214,6 +1214,17 @@ def _classification_metrics(y_true, y_pred, num_classes=None):
     }
 
 
+def _with_resplit_metadata(metrics, triggered, val_before, val_after):
+    """Attach compressed-mask fallback diagnostics to evaluation metrics."""
+    result = dict(metrics)
+    result.update({
+        'resplit_triggered': bool(triggered),
+        'val_supernodes_before_resplit': int(val_before),
+        'val_supernodes_after_resplit': int(val_after),
+    })
+    return result
+
+
 def _tensor_storage_bytes(value):
     if not torch.is_tensor(value):
         return 0
@@ -1384,8 +1395,10 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     # nearly empty when train_ratio is high (ogbn-mag: 85% train).
     # Must happen BEFORE loader creation so loaders see the updated masks.
     _n_val_pre = data[target_type].val_mask.sum().item()
-    if _n_val_pre < 5 and orig_data is not None:
+    _resplit_triggered = _n_val_pre < 5 and orig_data is not None
+    if _resplit_triggered:
         _resplit_supernodes(data, target_type, orig_data)
+    _n_val_post = data[target_type].val_mask.sum().item()
 
     soft_y = None
     if use_soft_labels and hasattr(data[target_type], 'soft_y'):
@@ -1573,11 +1586,14 @@ def _train_mini_batch_downstream(data, target_type, device_str,
         metrics   = _classification_metrics(y_orig, preds[super_idx],
                                             num_classes=num_classes)
         if return_metrics:
-            return metrics, elapsed
+            return _with_resplit_metadata(
+                metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
         return metrics['accuracy'], elapsed
 
     if return_metrics:
-        return _eval_metrics(test_loader), elapsed
+        metrics = _eval_metrics(test_loader)
+        return _with_resplit_metadata(
+            metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
     return best_test, elapsed
 
 
@@ -1627,8 +1643,10 @@ def train_on_heterodata(data, target_type, device_str,
     # Re-split supernodes proportionally when the inherited val_mask is empty.
     # Must happen BEFORE clone+to(dev) so the GPU clone carries the new masks.
     _n_val_pre = data[target_type].val_mask.sum().item()
-    if _n_val_pre < 5 and orig_data is not None:
+    _resplit_triggered = _n_val_pre < 5 and orig_data is not None
+    if _resplit_triggered:
         _resplit_supernodes(data, target_type, orig_data)
+    _n_val_post = data[target_type].val_mask.sum().item()
 
     cdata = data.clone().to(dev)  # clone: PyG .to() is in-place, original must stay on CPU
 
@@ -1760,7 +1778,8 @@ def train_on_heterodata(data, target_type, device_str,
         pred      = out[super_idx].argmax(1).cpu()
         metrics   = _classification_metrics(y_orig, pred, num_classes=num_classes)
         if return_metrics:
-            return metrics, elapsed
+            return _with_resplit_metadata(
+                metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
         return metrics['accuracy'], elapsed
 
     if return_metrics:
@@ -1774,7 +1793,8 @@ def train_on_heterodata(data, target_type, device_str,
         metrics = _classification_metrics(y[mask].cpu(),
                                           out.argmax(dim=1)[mask].cpu(),
                                           num_classes=num_classes)
-        return metrics, elapsed
+        return _with_resplit_metadata(
+            metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
     return best_test, elapsed
 
 
@@ -2026,6 +2046,11 @@ def run_once(data, target_type, ratio, device, pretrain,
         'test_macro_f1': test_metrics['macro_f1'],
         'test_micro_f1': test_metrics['micro_f1'],
         'test_support':  test_metrics['support'],
+        'resplit_triggered': test_metrics.get('resplit_triggered', False),
+        'val_supernodes_before_resplit': test_metrics.get(
+            'val_supernodes_before_resplit', float('nan')),
+        'val_supernodes_after_resplit': test_metrics.get(
+            'val_supernodes_after_resplit', float('nan')),
         'oracle_acc':   oracle['oracle_acc'],
         'oracle_val_acc': oracle_val['oracle_acc'],
         'oracle_gap':   oracle['oracle_acc'] - test_acc,
