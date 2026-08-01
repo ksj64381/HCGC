@@ -1214,14 +1214,25 @@ def _classification_metrics(y_true, y_pred, num_classes=None):
     }
 
 
-def _with_resplit_metadata(metrics, triggered, val_before, val_after):
-    """Attach compressed-mask fallback diagnostics to evaluation metrics."""
+def _with_resplit_metadata(metrics, triggered, val_before, val_after,
+                           epochs_ran=None, epochs_requested=None,
+                           best_val_acc=None, training_mode=None):
+    """Attach split and training diagnostics to evaluation metrics."""
     result = dict(metrics)
     result.update({
         'resplit_triggered': bool(triggered),
         'val_supernodes_before_resplit': int(val_before),
         'val_supernodes_after_resplit': int(val_after),
     })
+    if epochs_ran is not None:
+        result['epochs_ran'] = int(epochs_ran)
+    if epochs_requested is not None:
+        result['epochs_requested'] = int(epochs_requested)
+        result['early_stopped'] = int(epochs_ran) < int(epochs_requested)
+    if best_val_acc is not None:
+        result['best_val_acc'] = float(best_val_acc)
+    if training_mode is not None:
+        result['training_mode'] = str(training_mode)
     return result
 
 
@@ -1497,7 +1508,9 @@ def _train_mini_batch_downstream(data, target_type, device_str,
     ep_bar = _tqdm(range(1, epochs + 1), desc='  train', unit='ep',
                    ncols=88, leave=True)
     last_loss = float('nan')
+    epochs_ran = 0
     for ep in ep_bar:
+        epochs_ran = ep
         model.train()
         total_loss = 0.0
         n_batches  = 0
@@ -1587,13 +1600,15 @@ def _train_mini_batch_downstream(data, target_type, device_str,
                                             num_classes=num_classes)
         if return_metrics:
             return _with_resplit_metadata(
-                metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
+                metrics, _resplit_triggered, _n_val_pre, _n_val_post,
+                epochs_ran, epochs, best_val, 'mini_batch'), elapsed
         return metrics['accuracy'], elapsed
 
     if return_metrics:
         metrics = _eval_metrics(test_loader)
         return _with_resplit_metadata(
-            metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
+            metrics, _resplit_triggered, _n_val_pre, _n_val_post,
+            epochs_ran, epochs, best_val, 'mini_batch'), elapsed
     return best_test, elapsed
 
 
@@ -1686,7 +1701,9 @@ def train_on_heterodata(data, target_type, device_str,
     ep_bar = _tqdm(range(1, epochs + 1), desc='  train', unit='ep',
                    ncols=88, leave=True)
     edge_weight_dict = _edge_weight_dict(cdata) if use_edge_weights else None
+    epochs_ran = 0
     for ep in ep_bar:
+        epochs_ran = ep
         model.train()
         opt.zero_grad()
         out  = model(cdata.x_dict, cdata.edge_index_dict, target_type,
@@ -1779,7 +1796,8 @@ def train_on_heterodata(data, target_type, device_str,
         metrics   = _classification_metrics(y_orig, pred, num_classes=num_classes)
         if return_metrics:
             return _with_resplit_metadata(
-                metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
+                metrics, _resplit_triggered, _n_val_pre, _n_val_post,
+                epochs_ran, epochs, best_val, 'full_batch'), elapsed
         return metrics['accuracy'], elapsed
 
     if return_metrics:
@@ -1794,7 +1812,8 @@ def train_on_heterodata(data, target_type, device_str,
                                           out.argmax(dim=1)[mask].cpu(),
                                           num_classes=num_classes)
         return _with_resplit_metadata(
-            metrics, _resplit_triggered, _n_val_pre, _n_val_post), elapsed
+            metrics, _resplit_triggered, _n_val_pre, _n_val_post,
+            epochs_ran, epochs, best_val, 'full_batch'), elapsed
     return best_test, elapsed
 
 

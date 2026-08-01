@@ -243,8 +243,10 @@ def _coarsen_from_context(ctx, args):
             run_probe=getattr(args, 'run_probe', True),
             target_tolerance=getattr(args, 'auto_target_tolerance', 0.15),
         )
+        ctx['last_auto_coarsen_info'] = info
         t_c = time.perf_counter() - _t_auto  # total search time, not just one run
     else:
+        ctx['last_auto_coarsen_info'] = None
         cm, t_c = _run_coarsen(
             ctx['src_nodes'], ctx['dst_nodes'], ctx['weights'],
             ctx['coarsen_features'], ctx['type_boundaries'],
