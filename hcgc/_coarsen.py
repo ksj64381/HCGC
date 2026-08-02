@@ -22,7 +22,7 @@ try:
     _HCGC_AVAILABLE = True
 except ImportError:
     try:
-        # Look for pre-built binary in _ext/
+        # Also accept a user-supplied, environment-matched binary in _ext/.
         import importlib.util, sys, os, glob as _glob
         _ext_dir = os.path.join(os.path.dirname(__file__), '_ext')
         _pattern = os.path.join(_ext_dir, 'hcgc_module*.pyd') \
@@ -383,9 +383,9 @@ def _run_coarsen(src_nodes, dst_nodes, weights, all_features,
             "hcgc_module not built.\n"
             "  Option 1 (compile from source):\n"
             "    python setup.py build_ext --inplace\n"
-            "  Option 2 (pre-built binary):\n"
-            "    Copy a matching .pyd/.so into hcgc/_ext/\n"
-            "    See README.md for download links."
+            "  This repository ships source code, not pre-built binaries.\n"
+            "  Alternatively, place your own environment-matched .pyd/.so "
+            "in hcgc/_ext/."
         )
 
     _base_args = (

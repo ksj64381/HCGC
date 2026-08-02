@@ -1,5 +1,5 @@
 """
-hcgc -- Heterogeneous Graph Coarsening via coalition games.
+hcgc -- Heterogeneous Context-Guided Coarsening for typed graphs.
 
 Public API:
     compress(data, ratio=0.1, ...)  -> HCGCResult

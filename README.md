@@ -1,45 +1,26 @@
-# HCGC: Heterogeneous Graph Coarsening via Coalition Games
+# Type-Aware Heterogeneous Graph Coarsening via Mediator-Guided Coalition Formation
 
-A 10× compressed graph typically trains 5–8× faster per run; accuracy retention depends on the dataset and compression ratio (see the paper for full results).
+This repository implements **Heterogeneous Context-Guided Coarsening (HCGC)**,
+a type-aware graph coarsening method for heterogeneous graphs. HCGC learns a
+shared heterogeneous embedding space, forms same-type candidates through common
+mediator nodes, applies type-aware pairwise merging, and projects the resulting
+groups into a smaller `HeteroData` graph.
 
-## Quick Start
-
-```python
-import hcgc
-
-result = hcgc.compress(data, ratio=0.1)   # keep 10% of nodes = 10x compression
-
-result.data      # compressed HeteroData — use directly for GNN training
-result.ratio     # actual achieved ratio (e.g. 0.098 for ~10x)
-result.node_map  # {node_type: LongTensor} original → supernode mapping
-result.info      # {'compression': 10.2, 'n_nodes_orig': 1000000, ...}
-```
+The repository contains source code only. Compiled Python extensions (`.pyd`,
+`.so`, or `.dll`) are intentionally not tracked because they depend on the
+operating system, Python ABI, and compiler toolchain.
 
 ## Installation
 
-### Requirements
-
-**Core library**
-
-```bash
-pip install torch torch-geometric numpy scikit-learn pybind11
-```
-
-**Benchmark datasets** (`benchmark.py` only — install what you need)
-
-| Dataset | Extra package | Install |
-|---------|--------------|---------|
-| AMiner  | `pandas`     | `pip install pandas` |
-| ogbn-mag | `ogb`       | `pip install ogb` |
-| ACM (fallback) | `scipy` | `pip install scipy` |
-
-Or install everything at once:
+Use a Python environment with PyTorch and PyTorch Geometric. Install PyTorch for
+the CUDA version available on the target machine, then install the remaining
+dependencies:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### How To Compile the C++ kernel
+Build the C++ kernel locally before importing `hcgc`:
 
 ```bash
 git clone https://github.com/ksj64381/HCGC.git
@@ -47,115 +28,193 @@ cd HCGC
 python setup.py build_ext --inplace
 ```
 
-After building, `hcgc_module.*.pyd` (Windows) or `hcgc_module.*.so` (Linux/macOS) will appear in the project root.
+The build creates `hcgc_module.*.pyd` on Windows or `hcgc_module.*.so` on
+Linux/macOS in the project root. A C++14-compatible compiler and `pybind11` are
+required. Rebuild the extension after changing Python versions or platforms.
 
-
-## API Reference
-
-```python
-hcgc.compress(
-    data,                   # PyG HeteroData with node features + edge indices
-    ratio        = 0.1,     # fraction of nodes to keep  (0.1 = 10x compression)
-    target_type  = None,    # classification target node type (auto-detected)
-    pretrain     = True,    # GNN pretrain → better embedding quality
-    pretrain_epochs = 100,  # max pretrain epochs; early stopping applies
-    device       = 'auto',  # 'auto' | 'cpu' | 'cuda'
-    verbose      = True,
-) -> HCGCResult
-```
-
-**`HCGCResult` fields:**
-
-| Field | Type | Description |
-|---|---|---|
-| `.data` | `HeteroData` | Compressed graph, ready for PyG GNN training |
-| `.ratio` | `float` | Actual node retention ratio achieved |
-| `.node_map` | `dict` | `{node_type: LongTensor}` mapping original → supernode |
-| `.info` | `dict` | Detailed stats: compression factor, node/edge counts, timing |
-
-## Examples
-
-### Basic compression
+## Quick Start
 
 ```python
 from torch_geometric.datasets import IMDB
 import hcgc
 
-dataset = IMDB(root='/tmp/IMDB')
-data = dataset[0]
-
+data = IMDB(root="data/IMDB")[0]
 result = hcgc.compress(data, ratio=0.1)
-print(result.info)
-# {'compression': 10.3, 'n_nodes_orig': 12772, 'n_nodes_comp': 1240,
-#  'coarsen_time': 2.4, 'edges_orig': 37288, 'edges_comp': 3841, ...}
-```
 
-### Use compressed graph for GNN training
-
-```python
-from torch_geometric.nn import HeteroConv, SAGEConv
-import torch
-
-# result.data is a standard HeteroData — plug into any PyG model
 compressed_data = result.data
-
-# Map predictions back to original nodes
-# result.node_map['movie'] is a LongTensor of shape [n_orig_movie]
-# where result.node_map['movie'][i] is the supernode index for original node i
-supernode_pred = model(compressed_data)           # shape: [n_supernodes]
-original_pred  = supernode_pred[result.node_map['movie']]  # shape: [n_orig]
+actual_ratio = result.ratio
+movie_to_supernode = result.node_map["movie"]
+print(result.info)
 ```
 
-### No pretrain (faster, slightly lower quality)
+`result.data` is a standard PyG `HeteroData` object. Predictions on compressed
+target-type supernodes can be mapped back to original nodes with the
+corresponding entry in `result.node_map`.
+
+Selected API options:
 
 ```python
-result = hcgc.compress(data, ratio=0.2, pretrain=False)
+result = hcgc.compress(
+    data,
+    ratio=0.1,
+    target_type=None,
+    pretrain=True,
+    pretrain_epochs=100,
+    pretrain_patience=5,
+    device="auto",
+    pairwise_merge=True,
+    edge_weight_mode="binary",
+    ratio_search="fast",
+)
 ```
 
-### Specify target type explicitly
+The requested retention ratio is a target. The achieved ratio can differ
+slightly because the number of retained groups is discrete; use `result.ratio`
+and `result.info` when reporting compression.
 
-```python
-result = hcgc.compress(data, ratio=0.1, target_type='paper')
-```
+## Datasets
 
-## Reproducing Paper Results
+`benchmark.py` provides loaders for IMDB, DBLP, ACM, and additional heterogeneous
+graph datasets. PyG datasets are downloaded under `data/` by default. The ACM
+experiments require `data/ACM_dgl/ACM.mat`.
 
-Main results (Tables I–II, Fig. 3):
+The manuscript uses the conference-labeled three-class ACM variant. In
+`paper_pipeline_ablation.py`, `--datasets acm --acm-variant paper` resolves to
+the `acm3` loader. It is not the full ACM loader.
+
+## Reproducing Manuscript Results
+
+All commands below are run from the repository root after building the C++
+extension. The manuscript configuration uses a maximum mediator candidate
+budget of 128, binary projected edges, pairwise merging, hidden dimension 256,
+and 200 downstream training epochs.
+
+### Table I HCGC rows and Figure 3 HCGC curve
+
+The final HCGC measurement uses ten timed seeds (`42` through `51`), one
+discarded warm-up, and precise ratio search with a 2% relative retention
+tolerance:
 
 ```bash
-python experiments.py --dataset imdb dblp acm3 \
+python -u paper_pipeline_ablation.py \
+  --hcgc-root . \
+  --datasets imdb dblp acm \
+  --acm-variant paper \
+  --compressors hcgc \
   --models sage rgcn gat appnp \
-  --compressors hcgc freehgc cgc_homo random_type ahugc_style \
   --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
-  --runs 3 --warmup 1 --device cuda --plot-dir sweep_results
+  --max-candidates 128 \
+  --emb-methods gnn \
+  --runs 10 \
+  --warmup 1 \
+  --base-seed 42 \
+  --device cuda \
+  --ratio-search precise \
+  --auto-search-runs 12 \
+  --auto-target-tolerance 0.02 \
+  --pairwise-merge \
+  --edge-weight-mode binary \
+  --pretrain-epochs 100 \
+  --pretrain-patience 5 \
+  --train-epochs 200 \
+  --train-hidden 256 \
+  --no-baseline \
+  --plot-dir results/hcgc_k128_precise_10run
 ```
 
-Ablation study (Table III):
+The runner writes run-level CSV/JSON records, checkpoint files, model-level and
+cross-model summaries, plots, and `paper_pipeline_ablation_manifest.json`. The
+manifest records the command, Git state, run seeds, library/CUDA versions, GPU
+properties, ratio-search diagnostics, timings, memory measurements, storage,
+and achieved compression.
+
+### Table I controlled baselines
+
+FreeHGC, AH-UGC, and CGC-Homo are controlled in-pipeline adaptations rather
+than executions of the authors' official systems. Random-Type is a
+type-constrained random-grouping baseline. All four share the same
+compressed-graph construction and downstream evaluation interface:
 
 ```bash
-python ablation_experiments.py --datasets imdb dblp --models sage rgcn gat appnp \
-  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 --runs 10 --warmup 1 \
-  --ratio-search precise --device cuda --plot-dir ablation_results
+python experiments.py \
+  --datasets imdb dblp acm3 \
+  --models sage rgcn gat appnp \
+  --compressors random_type ahugc_style freehgc cgc_homo \
+  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
+  --runs 3 \
+  --warmup 1 \
+  --device cuda \
+  --pairwise-merge \
+  --edge-weight-mode binary \
+  --train-epochs 200 \
+  --train-hidden 256 \
+  --plot-dir results/controlled_baselines
 ```
 
-## Rebuilding the C++ Kernel
+Do not describe these outputs as exact reproductions of FreeHGC, AH-UGC, or
+the original CGC system. They preserve the methods' selection/grouping ideas
+under the common evaluation pipeline used by this repository.
 
-If the pre-built binary doesn't match your environment:
+### Table II ablation study
+
+The manuscript averages GraphSAGE, RGCN, GAT, and APPNP on IMDB, and GraphSAGE,
+RGCN, and GAT on DBLP. Run the datasets separately so the model sets match the
+reported table:
 
 ```bash
-pip install pybind11
-python setup.py build_ext --inplace
+python ablation_experiments.py \
+  --datasets imdb \
+  --models sage rgcn gat appnp \
+  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
+  --runs 10 --warmup 1 \
+  --ratio-search precise \
+  --edge-weight-mode binary \
+  --train-epochs 200 --train-hidden 256 \
+  --device cuda \
+  --plot-dir results/ablation_imdb_precise_10run
+
+python ablation_experiments.py \
+  --datasets dblp \
+  --models sage rgcn gat \
+  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
+  --runs 10 --warmup 1 \
+  --ratio-search precise \
+  --edge-weight-mode binary \
+  --train-epochs 200 --train-hidden 256 \
+  --device cuda \
+  --plot-dir results/ablation_dblp_precise_10run
 ```
 
-Requirements: a C++14-compatible compiler (MSVC on Windows, GCC/Clang on Linux/macOS).
+Warm-up executions are excluded from reported statistics. Report achieved
+node-compression factors rather than assuming that every method exactly reaches
+the requested target.
+
+## Repository Layout
+
+- `hcgc/`: public API, embedding, coarsening, graph construction, and baselines.
+- `hcgc_module.cpp`: C++ coarsening kernel source.
+- `setup.py`: local extension build configuration.
+- `benchmark.py`: dataset loaders and single-configuration evaluation pipeline.
+- `experiments.py`: multi-dataset/model/compressor sweeps.
+- `paper_pipeline_ablation.py`: final HCGC measurement and provenance runner.
+- `ablation_experiments.py`: core-component ablation runner.
+
+Generated data, experiment outputs, build directories, and compiled extensions
+are excluded from version control.
 
 ## Citation
 
-This work extends ideas from:
+The accompanying manuscript is:
 
-> Sonali Raj, Manoj Kumar, Sumit Kumar, Ruchir Gupta, Amit Kumar Jaiswal.
+> SeungJin Kim and Ikbeom Jang. "Type-Aware Heterogeneous Graph Coarsening via
+> Mediator-Guided Coalition Formation."
+
+HCGC adopts an iterative grouping motif from cooperative game-based graph
+coarsening, but the method in this repository is formulated as context-guided
+heterogeneous graph coarsening rather than as a new game-theoretic result.
+
+The related CGC work is:
+
+> Sonali Raj, Manoj Kumar, Sumit Kumar, Ruchir Gupta, and Amit Kumar Jaiswal.
 > "Graph Coarsening using Game Theoretic Approach." TMLR, 2026.
 > https://openreview.net/forum?id=5vLBjQJCln
-
-HCGC extends the original CGC algorithm to heterogeneous graphs
-with GNN-guided embedding and automatic compression control.

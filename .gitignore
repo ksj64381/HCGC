@@ -6,6 +6,13 @@ __pycache__/
 # C extensions
 *.so
 
+# Local HCGC datasets, experiment outputs, and optional extension cache
+data/
+results/
+sweep_results*/
+ablation_results*/
+hcgc/_ext/
+
 # Distribution / packaging
 .Python
 build/

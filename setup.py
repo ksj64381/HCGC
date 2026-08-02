@@ -21,7 +21,7 @@ ext_modules = [
 setup(
     name="hcgc",
     version="0.1.0",
-    description="Heterogeneous Graph Coarsening via Coalition Games",
+    description="Type-aware heterogeneous graph coarsening with mediator-guided merging",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     python_requires=">=3.8",
