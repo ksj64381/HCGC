@@ -3,14 +3,18 @@ Run HCGC ablation sweeps with the same evaluation path as experiments.py.
 
 Default scope is intended for the paper ablation:
 
-    datasets: imdb dblp acm
-    models  : sage rgcn gat
+    datasets: imdb dblp
+    models  : sage rgcn gat appnp
     ratios  : 0.5 0.3 0.25 0.2 0.15 0.1
+    seeds   : 42 through 51
+    candidate budget: 128
 
 Examples
 --------
     python ablation_experiments.py --runs 10 --warmup 1 --device cuda \
-        --ratio-search precise --auto-search-runs 8 --plot-dir ablation_results
+        --ratio-search precise --auto-search-runs 12 \
+        --auto-target-tolerance 0.02 --max-candidates 128 \
+        --no-baseline --plot-dir ablation_results
 
     # quick smoke test
     python ablation_experiments.py --datasets imdb --models sage \
@@ -98,9 +102,6 @@ DEFAULT_VARIANTS = [
     "no_embedding",
     "ball_multi",
     "no_reassign",
-    "type_thresholds",
-    "metapath_thresholds",
-    "quotient_de",
 ]
 
 
@@ -110,6 +111,14 @@ ROW_FIELDS = [
     "variant",
     "variant_label",
     "ratio",
+    "runs",
+    "base_seed",
+    "timed_run_seeds",
+    "max_candidates",
+    "auto_search_runs",
+    "auto_target_tolerance",
+    "pretrain_epochs",
+    "pretrain_patience",
     "compression",
     "node_compression",
     "node_ratio",
@@ -150,6 +159,34 @@ ROW_FIELDS = [
     "skip_reassignment",
     "type_thresholds",
     "metapath_thresholds",
+    "variant_flags",
+]
+
+RUN_FIELDS = [
+    "dataset",
+    "model",
+    "variant",
+    "variant_label",
+    "ratio",
+    "run",
+    "seed",
+    "max_candidates",
+    "compression",
+    "node_ratio",
+    "edge_compression",
+    "edge_ratio",
+    "storage_compression",
+    "test_acc",
+    "test_macro_f1",
+    "test_micro_f1",
+    "val_oracle",
+    "test_oracle",
+    "emb_dist",
+    "emb_cos",
+    "t_total",
+    "t_compress",
+    "t_train",
+    "resplit_triggered",
     "variant_flags",
 ]
 
@@ -228,20 +265,8 @@ def _variant_config(name, args):
     return cfg
 
 
-def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
-    base_acc = float("nan")
-    base_std = float("nan")
-    base_macro = float("nan")
-    base_macro_std = float("nan")
-    base_time = float("nan")
-    if base_stats is not None:
-        base_acc = base_stats.get("acc_mean", float("nan"))
-        base_std = base_stats.get("acc_std", float("nan"))
-        base_macro = base_stats.get("macro_f1_mean", float("nan"))
-        base_macro_std = base_stats.get("macro_f1_std", float("nan"))
-        base_time = base_stats.get("t_mean", float("nan"))
-
-    flags = {
+def _variant_flags(cfg):
+    return {
         k: cfg[k]
         for k in [
             "pretrain",
@@ -256,12 +281,36 @@ def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
             "compressor",
         ]
     }
+
+
+def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
+    base_acc = float("nan")
+    base_std = float("nan")
+    base_macro = float("nan")
+    base_macro_std = float("nan")
+    base_time = float("nan")
+    if base_stats is not None:
+        base_acc = base_stats.get("acc_mean", float("nan"))
+        base_std = base_stats.get("acc_std", float("nan"))
+        base_macro = base_stats.get("macro_f1_mean", float("nan"))
+        base_macro_std = base_stats.get("macro_f1_std", float("nan"))
+        base_time = base_stats.get("t_mean", float("nan"))
+
+    flags = _variant_flags(cfg)
     return {
         "dataset": dataset,
         "model": model,
         "variant": variant,
         "variant_label": VARIANTS[variant]["label"],
         "ratio": entry["ratio"],
+        "runs": args.runs,
+        "base_seed": args.base_seed,
+        "timed_run_seeds": json.dumps(entry.get("run_seeds", [])),
+        "max_candidates": args.max_candidates,
+        "auto_search_runs": args.auto_search_runs,
+        "auto_target_tolerance": args.auto_target_tolerance,
+        "pretrain_epochs": args.pretrain_epochs,
+        "pretrain_patience": args.pretrain_patience,
         "compression": entry["comp_mean"],
         "node_compression": entry["comp_mean"],
         "node_ratio": entry.get("node_ratio_mean", float("nan")),
@@ -304,6 +353,44 @@ def _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args):
         "metapath_thresholds": cfg["metapath_thresholds"],
         "variant_flags": json.dumps(flags, sort_keys=True),
     }
+
+
+def _run_rows_from_entry(dataset, model, variant, cfg, entry, args):
+    flags_json = json.dumps(_variant_flags(cfg), sort_keys=True)
+    rows = []
+    for run_idx, record in enumerate(entry.get("run_records", [])):
+        rows.append({
+            "dataset": dataset,
+            "model": model,
+            "variant": variant,
+            "variant_label": VARIANTS[variant]["label"],
+            "ratio": entry["ratio"],
+            "run": record.get("run", run_idx),
+            "seed": record.get("seed", args.base_seed + run_idx),
+            "max_candidates": record.get(
+                "max_candidates", args.max_candidates),
+            "compression": record.get("compression", float("nan")),
+            "node_ratio": record.get("node_ratio", float("nan")),
+            "edge_compression": record.get(
+                "edge_compression", float("nan")),
+            "edge_ratio": record.get("edge_ratio", float("nan")),
+            "storage_compression": record.get(
+                "storage_compression", float("nan")),
+            "test_acc": record.get("test_acc", float("nan")),
+            "test_macro_f1": record.get("test_macro_f1", float("nan")),
+            "test_micro_f1": record.get("test_micro_f1", float("nan")),
+            "val_oracle": record.get("oracle_val_acc", float("nan")),
+            "test_oracle": record.get("oracle_acc", float("nan")),
+            "emb_dist": record.get(
+                "target_emb_distortion", float("nan")),
+            "emb_cos": record.get("target_emb_cosine", float("nan")),
+            "t_total": record.get("t_total", float("nan")),
+            "t_compress": record.get("t_compress", float("nan")),
+            "t_train": record.get("t_train", float("nan")),
+            "resplit_triggered": record.get("resplit_triggered", False),
+            "variant_flags": flags_json,
+        })
+    return rows
 
 
 def _completed_keys(rows, ratios):
@@ -439,7 +526,7 @@ for (dataset, model), items in sorted(groups.items()):
         print(f"[plots] skipped: matplotlib failed in subprocess ({exc})")
 
 
-def _save_outputs(out_dir, rows, args):
+def _save_outputs(out_dir, rows, run_rows, args):
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = sorted(
         rows,
@@ -450,23 +537,57 @@ def _save_outputs(out_dir, rows, args):
             -float(r["ratio"]),
         ),
     )
+    run_rows = sorted(
+        run_rows,
+        key=lambda r: (
+            r["dataset"],
+            r["model"],
+            r["variant"],
+            -float(r["ratio"]),
+            int(r["run"]),
+        ),
+    )
 
     row_path = out_dir / "ablation_rows.csv"
+    run_path = out_dir / "ablation_run_rows.csv"
     json_path = out_dir / "ablation_rows.json"
+    manifest_path = out_dir / "ablation_manifest.json"
     summary_path = out_dir / "ablation_summary.csv"
     summary_json_path = out_dir / "ablation_summary.json"
     md_path = out_dir / "ablation_summary.md"
 
     _write_csv(row_path, rows, ROW_FIELDS)
+    _write_csv(run_path, run_rows, RUN_FIELDS)
     payload = {
         "datasets": args.datasets,
         "models": args.models,
         "variants": args.variants,
         "ratios": args.ratios,
         "rows": rows,
+        "run_rows": run_rows,
     }
     json_path.write_text(
         json.dumps(_json_clean(payload), indent=2),
+        encoding="utf-8",
+    )
+    manifest = {
+        "arguments": vars(args),
+        "timed_run_seeds": [
+            int(args.base_seed) + i for i in range(args.runs)
+        ],
+        "warmup_seed_policy": (
+            "base_seed + 1,000,000 + warmup_index; discarded"
+        ),
+        "paper_protocol": {
+            "candidate_budget": int(args.max_candidates),
+            "ratio_search": args.ratio_search,
+            "auto_search_runs": int(args.auto_search_runs),
+            "auto_target_tolerance": args.auto_target_tolerance,
+            "edge_weight_mode": args.edge_weight_mode,
+        },
+    }
+    manifest_path.write_text(
+        json.dumps(_json_clean(manifest), indent=2),
         encoding="utf-8",
     )
 
@@ -480,7 +601,9 @@ def _save_outputs(out_dir, rows, args):
     _write_plots(out_dir, rows)
 
     print(f"[save] rows    : {row_path}")
+    print(f"[save] runs    : {run_path}")
     print(f"[save] data    : {json_path}")
+    print(f"[save] manifest: {manifest_path}")
     print(f"[save] summary : {summary_path}")
     print(f"[save] table   : {md_path}")
 
@@ -490,9 +613,10 @@ def main():
         description="Run HCGC ablation sweeps and save CSV/JSON/table outputs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--datasets", nargs="+", default=["imdb", "dblp", "acm"],
+    parser.add_argument("--datasets", nargs="+", default=["imdb", "dblp"],
                         choices=list(LOADERS))
-    parser.add_argument("--models", nargs="+", default=["sage", "rgcn", "gat"],
+    parser.add_argument("--models", nargs="+",
+                        default=["sage", "rgcn", "gat", "appnp"],
                         choices=list(_DOWNSTREAM_MODELS))
     parser.add_argument("--ratios", nargs="+", type=float,
                         default=[0.5, 0.3, 0.25, 0.2, 0.15, 0.1])
@@ -500,13 +624,18 @@ def main():
                         choices=sorted(VARIANTS))
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--base-seed", type=int, default=42,
+                        help="Timed run i uses base_seed + i")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--root", default="data")
     parser.add_argument("--plot-dir", default="ablation_results")
     parser.add_argument("--ratio-search", default="precise",
                         choices=["fast", "precise"])
-    parser.add_argument("--auto-search-runs", type=int, default=8)
-    parser.add_argument("--auto-target-tolerance", type=float, default=None)
+    parser.add_argument("--auto-search-runs", type=int, default=12)
+    parser.add_argument("--auto-target-tolerance", type=float, default=0.02)
+    parser.add_argument("--max-candidates", type=int, default=128)
+    parser.add_argument("--pretrain-epochs", type=int, default=100)
+    parser.add_argument("--pretrain-patience", type=int, default=5)
     parser.add_argument("--train-epochs", type=int, default=200)
     parser.add_argument("--train-hidden", type=int, default=256)
     parser.add_argument("--mini-batch-size", type=int, default=512)
@@ -527,10 +656,19 @@ def main():
                         help="Print planned jobs without running them.")
     args = parser.parse_args()
 
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.max_candidates < 1:
+        parser.error("--max-candidates must be at least 1")
+
     args.ratios = sorted(args.ratios, reverse=True)
     out_dir = Path(args.plot_dir)
     row_path = out_dir / "ablation_rows.csv"
+    run_path = out_dir / "ablation_run_rows.csv"
     rows = _load_existing(row_path) if args.resume else []
+    run_rows = _load_existing(run_path) if args.resume else []
     done = _completed_keys(rows, args.ratios) if args.resume else set()
 
     jobs = []
@@ -550,6 +688,11 @@ def main():
     print(f"variants : {args.variants}")
     print(f"ratios   : {args.ratios}")
     print(f"runs     : {args.warmup} warmup + {args.runs} timed")
+    print(f"seeds    : {args.base_seed} .. "
+          f"{args.base_seed + args.runs - 1}")
+    print(f"max cand : {args.max_candidates}")
+    print(f"search   : {args.ratio_search}, runs={args.auto_search_runs}, "
+          f"tolerance={args.auto_target_tolerance}")
     print(f"output   : {out_dir}")
     print(f"jobs     : {len(jobs)}")
     print("=" * 80)
@@ -603,6 +746,10 @@ def main():
             ratio_search=args.ratio_search,
             auto_search_runs=args.auto_search_runs,
             auto_target_tolerance=args.auto_target_tolerance,
+            max_candidates=args.max_candidates,
+            base_seed=args.base_seed,
+            pretrain_epochs=args.pretrain_epochs,
+            pretrain_patience=args.pretrain_patience,
         )
         if (not args.no_baseline) and base_key not in baseline_cache:
             baseline_cache[base_key] = base_stats
@@ -617,7 +764,18 @@ def main():
             _row_from_entry(dataset, model, variant, cfg, base_stats, entry, args)
             for entry in sweep
         )
-        _save_outputs(out_dir, rows, args)
+        run_rows = [
+            r for r in run_rows
+            if not (r["dataset"] == dataset
+                    and r["model"] == model
+                    and r["variant"] == variant)
+        ]
+        for entry in sweep:
+            run_rows.extend(
+                _run_rows_from_entry(
+                    dataset, model, variant, cfg, entry, args)
+            )
+        _save_outputs(out_dir, rows, run_rows, args)
 
     print("\nCompleted ablation sweep.")
 

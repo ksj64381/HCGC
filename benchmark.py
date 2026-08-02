@@ -38,6 +38,7 @@ except ImportError:
         return it
 
 import hcgc
+from hcgc._config import set_seed
 from hcgc._baselines import (
     compress_ahugc_style,
     compress_cgc_homo,
@@ -1900,13 +1901,15 @@ def oracle_upper_bound(result, orig_data, target_type, mask_name='test_mask'):
 
 def run_baseline(data, target_type, device, train_epochs=200, train_hidden=256,
                  mini_batch_size=512, model_name='sage', force_full_batch=False,
-                 return_metrics=False):
+                 return_metrics=False, run_seed=None):
     """Train on the original graph. Returns (test_acc, elapsed) by default.
 
     Uses a generous patience (= train_epochs // 5) so the model trains until
     genuine convergence rather than stopping at an early local plateau.
     Large graphs (>100 k nodes) are handled automatically via mini-batch.
     """
+    if run_seed is not None:
+        set_seed(int(run_seed))
     return train_on_heterodata(data, target_type, device,
                                epochs=train_epochs, hidden=train_hidden,
                                patience=train_epochs // 5,
@@ -1929,13 +1932,17 @@ def run_once(data, target_type, ratio, device, pretrain,
              metapath_thresholds=False, edge_weight_mode='binary',
              freeze_node_types=None, compressor='hcgc',
              ratio_search='fast', auto_search_runs=8,
-             auto_target_tolerance=None):
+             auto_target_tolerance=None, max_candidates=5,
+             run_seed=42):
     """Run one full compress → train cycle.
 
     Returns a dict with compression ratios, timing, and test accuracy.
     train_patience=None (default): run all train_epochs, no early stopping.
     """
     # ── Compression ───────────────────────────────────────────────────────────
+    run_seed = int(run_seed)
+    max_candidates = int(max_candidates)
+    set_seed(run_seed)
     compressor = str(compressor or 'hcgc').lower()
     if compressor not in _COMPRESSORS:
         raise ValueError(f"Unknown compressor={compressor!r}; "
@@ -2011,6 +2018,8 @@ def run_once(data, target_type, ratio, device, pretrain,
                 ratio_search = ratio_search,
                 auto_search_runs = auto_search_runs,
                 auto_target_tolerance = auto_target_tolerance,
+                max_candidates = max_candidates,
+                base_seed = run_seed,
             )
     t_compress = time.perf_counter() - t0
     oracle = oracle_upper_bound(result, data, target_type, 'test_mask')
@@ -2019,6 +2028,9 @@ def run_once(data, target_type, ratio, device, pretrain,
     # ── Downstream training ───────────────────────────────────────────────────
     # Default evaluation maps predictions back to original node labels; the
     # legacy supernode protocol is available through --eval-protocol supernode.
+    # Pair downstream initialization across methods even when their embedding
+    # and coarsening stages consume different amounts of random state.
+    set_seed(run_seed)
     test_metrics, t_train = train_downstream(
         result, data, target_type,
         device_str       = device,
@@ -2080,6 +2092,8 @@ def run_once(data, target_type, ratio, device, pretrain,
         'target_emb_distortion': result.info.get('target_emb_distortion', float('nan')),
         'target_emb_cosine': result.info.get('target_emb_cosine', float('nan')),
         'compressor': compressor,
+        'seed': run_seed,
+        'max_candidates': max_candidates,
         'ratio_search': ratio_search,
         'n_nodes_orig': n_orig,
         'n_nodes_comp': n_comp,

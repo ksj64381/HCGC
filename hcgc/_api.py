@@ -52,6 +52,8 @@ def compress(
     ratio_search = 'fast',
     auto_search_runs = 8,
     auto_target_tolerance = None,
+    max_candidates = 5,
+    base_seed = 42,
 ) -> HCGCResult:
     """Compress a heterogeneous graph using HCGC.
 
@@ -127,6 +129,10 @@ def compress(
                         : Optional iterable of node-type names that must not
                           be compressed. Their original nodes are mapped to
                           identity singleton supernodes after coarsening.
+        max_candidates  : Maximum source candidates retained per mediator.
+                          The manuscript experiments use 128.
+        base_seed       : Random seed used for embedding construction,
+                          coarsening, and other stochastic HCGC stages.
 
     Returns:
         HCGCResult with:
@@ -204,7 +210,9 @@ def compress(
                        metapath_thresholds=metapath_thresholds,
                        ratio_search=ratio_search,
                        auto_search_runs=auto_search_runs,
-                       auto_target_tolerance=auto_target_tolerance)
+                       auto_target_tolerance=auto_target_tolerance,
+                       max_candidates=max_candidates,
+                       base_seed=base_seed)
 
     # ── Pretrain (or fast-embed) + extract flat arrays ────────────────────────
     _t = time.perf_counter()
@@ -260,6 +268,8 @@ def compress(
         'ratio_search': ratio_search,
         'auto_search_runs': int(auto_search_runs),
         'auto_target_tolerance': float(auto_target_tolerance),
+        'max_candidates': int(max_candidates),
+        'base_seed': int(base_seed),
         'target_emb_distortion': emb_diag['distortion'],
         'target_emb_cosine': emb_diag['cosine'],
         'coarsening_edge_input': dict(ctx['edge_input_stats']),
@@ -415,7 +425,9 @@ def _build_args(ratio, pretrain, pretrain_epochs,
                 metapath_thresholds=False,
                 ratio_search='fast',
                 auto_search_runs=8,
-                auto_target_tolerance=0.15):
+                auto_target_tolerance=0.15,
+                max_candidates=5,
+                base_seed=42):
     """Build default args namespace for compress()."""
     return types.SimpleNamespace(
         # Coarsening
@@ -443,7 +455,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         hcgc_target_comp_ratio      = 0.0,
         hcgc_num_levels             = 5,
         hub_anchor_percentile       = 0.0,
-        max_candidates              = 5,
+        max_candidates              = int(max_candidates),
         auto_hub_caps               = True,
         hub_degree_caps             = '',
         num_levels                  = 5,
@@ -476,7 +488,7 @@ def _build_args(ratio, pretrain, pretrain_epochs,
         force_mini_batch            = False,
         num_neighbors               = num_neighbors,
         # Misc
-        base_seed                   = 42,
+        base_seed                   = int(base_seed),
         use_label_aware_split       = False,
         # Probe (accuracy estimation via linear classifier on embeddings).
         # Disabled by default in compress() because: (a) probe results are not

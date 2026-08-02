@@ -53,7 +53,9 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
               pairwise_merge=True, merge_objective='ward',
               skip_reassignment=False,
               ratio_search='fast', auto_search_runs=8,
-              auto_target_tolerance=None):
+              auto_target_tolerance=None, max_candidates=5,
+              base_seed=42, pretrain_epochs=100,
+              pretrain_patience=5):
     """Run compress?뭪rain for each ratio and return collected stats.
 
     Returns
@@ -76,11 +78,14 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
     print(f"  merge    : {'pairwise' if pairwise_merge or compressor == 'cgc_type' else 'ball-multi'}")
     print(f"  merge_obj: {merge_objective}")
     print(f"  reassign : {not skip_reassignment}")
+    print(f"  max cand : {int(max_candidates)}")
     _thresh_mode = ('metapath-auto' if metapath_thresholds
                     else 'type-auto' if type_thresholds else 'global')
     print(f"  thresh   : {_thresh_mode}")
     print(f"  device   : {device}")
     print(f"  runs     : {warmup} warmup  +  {runs} timed")
+    print(f"  seeds    : {int(base_seed)} .. "
+          f"{int(base_seed) + max(int(runs) - 1, 0)}")
     print(f"{'='*W}\n")
 
     # ?? Load dataset ??????????????????????????????????????????????????????????
@@ -107,13 +112,16 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
         print(f"\nBaseline: training on original graph ({runs} runs) ...")
         base_recs = []
         for i in range(runs):
-            print(f"  baseline run {i+1}/{runs} ... ", end='', flush=True)
+            run_seed = int(base_seed) + i
+            print(f"  baseline run {i+1}/{runs} (seed={run_seed}) ... ",
+                  end='', flush=True)
             acc, t = run_baseline(data, target_type, device,
                                   train_epochs=train_epochs,
                                   train_hidden=train_hidden,
                                   mini_batch_size=mini_batch_size,
                                   model_name=model_name,
-                                  return_metrics=True)
+                                  return_metrics=True,
+                                  run_seed=run_seed)
             base_recs.append({
                 'test_acc': acc['accuracy'],
                 'test_macro_f1': acc['macro_f1'],
@@ -140,9 +148,12 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
         wup_ratio = ratios[0]
         print(f"\nWarmup ({warmup} run(s), ratio={wup_ratio}) ...")
         for i in range(warmup):
+            warm_seed = int(base_seed) + 1_000_000 + i
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
                      pretrain=False, verbose=False,
+                     pretrain_epochs=pretrain_epochs,
+                     pretrain_patience=pretrain_patience,
                      mini_batch_size=mini_batch_size, model_name=model_name,
                      coarsen_l2_normalize=coarsen_l2_normalize,
                      relprop_hops=relprop_hops,
@@ -156,11 +167,15 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      compressor=compressor,
                      ratio_search=ratio_search,
                      auto_search_runs=auto_search_runs,
-                     auto_target_tolerance=auto_target_tolerance)
+                     auto_target_tolerance=auto_target_tolerance,
+                     max_candidates=max_candidates,
+                     run_seed=warm_seed)
             print(f"  warmup {i+1}/{warmup} [no-pretrain]  ({time.perf_counter()-t_wu:.1f}s)")
             t_wu = time.perf_counter()
             run_once(data, target_type, ratio=wup_ratio, device=device,
                      pretrain=pretrain, verbose=False,
+                     pretrain_epochs=pretrain_epochs,
+                     pretrain_patience=pretrain_patience,
                      train_epochs=train_epochs, train_hidden=train_hidden,
                      mini_batch_size=mini_batch_size, model_name=model_name,
                      emb_method=emb_method,
@@ -176,7 +191,9 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                      compressor=compressor,
                      ratio_search=ratio_search,
                      auto_search_runs=auto_search_runs,
-                     auto_target_tolerance=auto_target_tolerance)
+                     auto_target_tolerance=auto_target_tolerance,
+                     max_candidates=max_candidates,
+                     run_seed=warm_seed)
             print(f"  warmup {i+1}/{warmup} [pretrain={pretrain}]  ({time.perf_counter()-t_wu:.1f}s)")
 
     # ?? Ratio sweep ???????????????????????????????????????????????????????????
@@ -185,12 +202,16 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
         print(f"\nRatio {ratio:.2f}  ({1/ratio:.1f}x target)  - {runs} run(s) ...")
         recs = []
         for i in range(runs):
-            print(f"  run {i+1}/{runs} ... ", end='', flush=True)
+            run_seed = int(base_seed) + i
+            print(f"  run {i+1}/{runs} (seed={run_seed}) ... ",
+                  end='', flush=True)
             r = run_once(
                 data, target_type,
                 ratio           = ratio,
                 device          = device,
                 pretrain        = pretrain,
+                pretrain_epochs = pretrain_epochs,
+                pretrain_patience = pretrain_patience,
                 train_epochs    = train_epochs,
                 train_hidden    = train_hidden,
                 verbose         = False,
@@ -210,7 +231,11 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
                 ratio_search    = ratio_search,
                 auto_search_runs = auto_search_runs,
                 auto_target_tolerance = auto_target_tolerance,
+                max_candidates   = max_candidates,
+                run_seed         = run_seed,
             )
+            r['run'] = i
+            r['seed'] = run_seed
             recs.append(r)
             print(f"comp={r['compression']:.2f}x  "
                   f"edge_comp={r.get('edge_compression', float('nan')):.2f}x  "
@@ -279,6 +304,9 @@ def run_sweep(dataset, ratios, runs=3, warmup=1, device='auto', root='data',
             'tt_mean':  tt_m,  'tt_std':  tt_s,
             'tc_mean':  tc_m,
             'tr_mean':  tr_m,
+            'max_candidates': int(max_candidates),
+            'run_seeds': [int(r['seed']) for r in recs],
+            'run_records': recs,
         }
         if base_stats is not None:
             entry['acc_drop']      = acc_m - base_stats['acc_mean']
@@ -651,6 +679,8 @@ def main():
                         help='Timed runs per ratio')
     parser.add_argument('--warmup',   type=int, default=1,
                         help='Warmup runs before the first ratio (excluded from stats)')
+    parser.add_argument('--base-seed', type=int, default=42,
+                        help='Timed run i uses base_seed + i')
     parser.add_argument('--device',   default='auto')
     parser.add_argument('--root',     default='data',
                         help='Dataset download root')
@@ -684,6 +714,10 @@ def main():
                         help='Compressed super-edge weighting mode.')
     parser.add_argument('--train-epochs', type=int, default=200)
     parser.add_argument('--train-hidden', type=int, default=256)
+    parser.add_argument('--pretrain-epochs', type=int, default=100)
+    parser.add_argument('--pretrain-patience', type=int, default=5)
+    parser.add_argument('--max-candidates', type=int, default=5,
+                        help='Maximum source candidates retained per mediator')
     parser.add_argument('--mini-batch-size', type=int, default=512)
     parser.add_argument('--model',    default='sage', choices=list(_DOWNSTREAM_MODELS),
                         help='Downstream GNN architecture (ignored when --models is used)')
@@ -758,6 +792,10 @@ def main():
                     ratio_search    = args.ratio_search,
                     auto_search_runs = args.auto_search_runs,
                     auto_target_tolerance = args.auto_target_tolerance,
+                    max_candidates   = args.max_candidates,
+                    base_seed        = args.base_seed,
+                    pretrain_epochs  = args.pretrain_epochs,
+                    pretrain_patience = args.pretrain_patience,
                 )
                 if do_base and mname not in baseline_by_model:
                     baseline_by_model[mname] = base_stats

@@ -65,6 +65,8 @@ result = hcgc.compress(
     pairwise_merge=True,
     edge_weight_mode="binary",
     ratio_search="fast",
+    max_candidates=128,
+    base_seed=42,
 )
 ```
 
@@ -157,37 +159,34 @@ under the common evaluation pipeline used by this repository.
 
 ### Table II ablation study
 
-The manuscript averages GraphSAGE, RGCN, GAT, and APPNP on IMDB, and GraphSAGE,
-RGCN, and GAT on DBLP. Run the datasets separately so the model sets match the
-reported table:
+The corrected ablation protocol uses the same four downstream models, candidate
+budget, retention targets, timed seeds, and precise ratio-search settings as the
+final HCGC measurement. The Full HCGC row can be taken from the Table I HCGC
+run above; the following command runs only the three component variants:
 
 ```bash
 python ablation_experiments.py \
-  --datasets imdb \
+  --datasets imdb dblp \
   --models sage rgcn gat appnp \
+  --variants no_embedding ball_multi no_reassign \
   --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
-  --runs 10 --warmup 1 \
+  --runs 10 --warmup 1 --base-seed 42 \
   --ratio-search precise \
+  --auto-search-runs 12 \
+  --auto-target-tolerance 0.02 \
+  --max-candidates 128 \
+  --pretrain-epochs 100 --pretrain-patience 5 \
   --edge-weight-mode binary \
   --train-epochs 200 --train-hidden 256 \
+  --no-baseline \
   --device cuda \
-  --plot-dir results/ablation_imdb_precise_10run
-
-python ablation_experiments.py \
-  --datasets dblp \
-  --models sage rgcn gat \
-  --ratios 0.5 0.3 0.25 0.2 0.15 0.1 \
-  --runs 10 --warmup 1 \
-  --ratio-search precise \
-  --edge-weight-mode binary \
-  --train-epochs 200 --train-hidden 256 \
-  --device cuda \
-  --plot-dir results/ablation_dblp_precise_10run
+  --plot-dir results/ablation_edgefix_k128_precise_10run
 ```
 
 Warm-up executions are excluded from reported statistics. Report achieved
 node-compression factors rather than assuming that every method exactly reaches
-the requested target.
+the requested target. `ablation_run_rows.csv` stores every seed-level result;
+`ablation_rows.csv` and `ablation_summary.csv` store aggregate results.
 
 ## Repository Layout
 
